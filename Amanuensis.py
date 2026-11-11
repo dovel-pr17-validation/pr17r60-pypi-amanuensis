@@ -1,0 +1,13971 @@
+# ============================================
+# AMANUENSIS -- A HUMAN-LIKE TYPING ASSISTANT
+# ============================================
+#
+# Reads text from a user-selected file and types it into whatever
+# window currently has focus, using randomized delays, common-bigram
+# speed-ups, simulated typos and "reworking" mistakes, and long
+# research-style breaks to emulate natural human typing.
+#
+# VERSION HISTORY (most recent first)
+# ------------------------------------------------------------
+# v5.32.0 (2026-11-09) -- Real key press timing
+#   - Added: A Key Press Timing card on the Speed tab. When it is on, every
+#     letter and space is pressed down, held for a short random time (40 to 110
+#     milliseconds by default), and then released, instead of being pressed and
+#     released in one instant. The hold time range is set in the card.
+#   - Added: Shift is held for capital letters. Shift goes down just before the
+#     letter and comes up just after it, like a real hand does. It has its own
+#     checkbox and is on by default once Key Press Timing is on.
+#   - Added: Optional overlap, off by default. On a quick pair of letters typed
+#     by opposite hands, the next key goes down just before the first one comes
+#     up, like a fast typist. A chance box sets how often.
+#   - Added: Six new settings (enable_key_hold, key_hold_min_ms, key_hold_max_ms,
+#     enable_shift_hold, enable_key_overlap, key_overlap_chance), each wired into
+#     validate_settings(), the settings dict, both snapshot functions, and a new
+#     Reset This Section list (Key Press Timing). They are saved in profiles.
+#   - Modified: The hold time is taken out of the gap before the next key, so
+#     the typing speed (Target WPM) and the time estimate stay the same.
+#   - Notes: Key Press Timing is off by default. Only plain letters and the
+#     space bar use it. Numbers, punctuation, and other characters are typed the
+#     old way (instant), because pressing them by key name can type a different
+#     character on a non-US keyboard layout. If a key cannot be pressed by name
+#     (for example a non-Latin layout), that character is typed the old way.
+#     Every held key is released on Stop and when the run ends, and a short
+#     safety timer (0.2 seconds) releases a key that an overlap left down, so
+#     a key can never get stuck and auto-repeat. Preview runs press no keys.
+#     Backspace and shortcuts are still instant. No new packages.
+#
+# v5.31.0 (2026-10-30) -- Editor type
+#   - Added: An Editor Type card on the Window tab with one new setting,
+#     editor_mode (Plain text, Google Docs or Word, or Code editor), saved with
+#     profiles and restored on launch. Plain text is the default and types
+#     exactly as before. The card has its own Reset This Section button.
+#   - Added: Google Docs or Word mode types a line that starts with a list
+#     marker (1. or a) or - or * or + or a round bullet, with up to 12 leading
+#     spaces) as space, Left, marker, Right, so the editor does not turn the
+#     line into a list. The text on screen ends up the same as the file.
+#   - Added: Code editor mode clears the editor's own indent at the start of
+#     every line after the first (Shift+Home, a space, Backspace), so the
+#     line's own spaces are not added on top of it. Blank lines are cleared too.
+#   - Modified: Starter profiles leave the editor type as it is, and the load
+#     message lists it. Auto Profile can pick it, because a saved profile
+#     carries it.
+#   - Notes: New plain functions: normalize_editor_mode(), find_editor_list_marker(),
+#     plan_editor_line_start(), editor_marker_span_is_clear(). The two key
+#     sequences are _run_editor_clear_indent() and _run_editor_list_marker(),
+#     called from one spot in the typing loop. A list marker is typed as one
+#     unit, so it is only used when no format shortcut, pause marker, or left
+#     mistake is planned inside it; otherwise it is typed the normal way. Both
+#     sequences never delete real text and always finish once started. Preview
+#     runs skip them. Not handled: auto-closing brackets, suggestion pop-ups,
+#     and other autocorrect (smart quotes, symbols). Older settings and profile
+#     files without this setting load as Plain text. No new packages.
+#
+# v5.30.0 (2026-10-29) -- Automatic tests
+#   - Added: A tests/ folder with 89 automatic checks (Python's built-in unittest,
+#     so no new package). They cover protected text, the [[b]] and [[i]] markers,
+#     {{pause}} markers, Markdown input, every Smart Text Fixes rule, settings
+#     checking and the settings save and load round trip, the typed text check,
+#     and the Learn My Speed measuring. Run them with:
+#     uv run python -m unittest discover -s tests -v
+#   - Added: A Tests job in the CI workflow, so every pull request runs them
+#     together with the other checks. The tests also run in the CI py_compile
+#     and pyflakes steps.
+#   - Fixed: Typing nan, inf, or -inf into a number box (delays, pauses, break
+#     lengths, chances, strengths) was accepted. Those words pass every "less
+#     than" check and could freeze or crash a run. A new function,
+#     parse_finite_float(), now refuses them in validate_settings(): the boxes
+#     that show an error still show it, and strength and chance boxes reset to
+#     a safe number, like they already did for other bad text.
+#   - Notes: Amanuensis.py builds its window as soon as it loads, so the tests
+#     use tests/app_loader.py, which reads the file as text and runs only its
+#     functions, plain settings, and tk variables (as stand-ins). The app code
+#     was not restructured for this. No new settings and no new packages.
+#
+# ============================================
+
+import pyautogui
+import keyboard
+import threading
+import queue
+import random
+import re
+import time
+import json
+import csv
+import os
+import sys
+import difflib
+import hashlib
+import html
+import math
+import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+import zipfile
+import zlib
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, filedialog
+from tkinter import messagebox as native_messagebox
+
+# CustomTkinter gives the whole app its rounded, modern look. It is required.
+try:
+    import customtkinter as ctk
+except ImportError:
+    _missing_root = tk.Tk()
+    _missing_root.withdraw()
+    native_messagebox.showerror(
+        "Missing package",
+        "Amanuensis needs the CustomTkinter package.\n\nInstall it with:\n    uv add customtkinter",
+    )
+    sys.exit(1)
+
+try:
+    import pygetwindow as gw
+    HAS_PYGETWINDOW = True
+except ImportError:
+    HAS_PYGETWINDOW = False
+
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    HAS_WINSOUND = False
+
+# --------------------------------------------
+# THREADING & STATE MANAGEMENT
+# --------------------------------------------
+# threading.Event objects (rather than plain booleans) keep the GUI
+# thread and the background typing thread in sync without race
+# conditions.
+stop_event = threading.Event()
+pause_event = threading.Event()
+focus_lost_event = threading.Event()
+# Set by the Skip Break button or hotkey to end the research break that is
+# counting down right now (Update #50). It is only ever set while a break is
+# running, and the typing thread clears it when that break ends.
+skip_break_event = threading.Event()
+
+# Protects every read-modify-write on resume_state.json. Both the
+# background typing thread (autosave) and the main thread (Stop,
+# start_typing, clear button) can write, so we must guard them.
+_resume_store_lock = threading.Lock()
+
+# --------------------------------------------
+# CROSS-THREAD GUI DISPATCH
+# --------------------------------------------
+# Tkinter widgets are only safe to touch from the main thread. Two
+# other threads need to trigger GUI actions: the `keyboard` library's
+# own listener thread (for global hotkeys) and the background typing
+# thread (on errors or when a run finishes). Instead of calling
+# Tkinter functions directly from those threads, they drop a
+# zero-argument callable into this queue; process_gui_queue() (run
+# via window.after on the main thread) drains it and calls those
+# functions safely, on the main thread, where they belong.
+gui_action_queue = queue.Queue()
+
+
+def run_on_main_thread(func):
+    """Call from any background thread instead of touching Tkinter
+    directly. Schedules func to run on the main thread shortly."""
+    gui_action_queue.put(func)
+
+
+def process_gui_queue():
+    try:
+        while True:
+            func = gui_action_queue.get_nowait()
+            func()
+    except queue.Empty:
+        pass
+    window.after(50, process_gui_queue)
+
+
+class TyperState:
+    """Holds all mutable run-time state shared between the GUI thread
+    and the background typing thread. Only simple attribute reads/
+    writes happen across threads, which is safe under the GIL for
+    these use cases."""
+
+    def __init__(self):
+        self.is_running = False
+        self.chars_typed = 0
+        self.total_chars = 0
+        self.total_newlines = 0
+        self.newlines_typed = 0
+        self.start_time = 0
+        self.paused_duration = 0.0  # accumulated pause + break time, excluded from WPM/ETA
+        self.wpm = 0
+        self.status = "Idle"
+        self.next_mistake_words = 0
+        self.next_break_paragraphs = 0
+        self.logging_enabled = False
+        self.log_entries = []  # list of (timestamp, event, detail)
+        self.locked_window_title = ""
+        self.settings = {}
+        self.clean_text = ""  # set by type_text() after parse_input_markers(); used by stop_typing()
+        self.left_mistakes = []  # mistakes purposely left in the text this run (Update #24)
+        self.left_mistakes_resumed = False  # True if a resumed file may hide earlier-session mistakes
+        self.blocked_seconds = 0.0  # total time paused by the person, auto-pause, or lost focus (Update #27)
+        self.target_end_time = 0.0  # when the run should finish under a target time (0 = no target)
+        self.session_breaks_left = 0  # long session breaks still ahead in the current file
+        self.lookback_pending = None  # second revision pass in progress: {draft, original, stage} (Update #34)
+        self.select_retype_pending = None  # select and retype in progress: {draft, original} (Update #35)
+        self.in_research_break = False  # True only while a research break is counting down (Update #50)
+        self.text_check_results = []  # one record per file checked after typing (Update #51)
+
+
+state = TyperState()
+
+# --------------------------------------------
+# COMMON LETTER PAIRS (typed slightly faster)
+# --------------------------------------------
+COMMON_PAIRS = {'th', 'he', 'an', 'in', 'er', 're', 'nd', 'ou', 'en', 'to', 'nt', 'ha', 'it', 'is', 'or', 'as'}
+
+# --------------------------------------------
+# FINGER AND HAND TIMING (Update #28)
+# --------------------------------------------
+# Which hand and finger types each letter on a QWERTY keyboard (standard
+# touch typing). Each letter maps to (hand, finger). Index fingers cover two
+# columns of keys, so they own more letters than the other fingers.
+FINGER_FOR_LETTER = {
+    'q': ('left', 'pinky'), 'a': ('left', 'pinky'), 'z': ('left', 'pinky'),
+    'w': ('left', 'ring'), 's': ('left', 'ring'), 'x': ('left', 'ring'),
+    'e': ('left', 'middle'), 'd': ('left', 'middle'), 'c': ('left', 'middle'),
+    'r': ('left', 'index'), 'f': ('left', 'index'), 'v': ('left', 'index'),
+    't': ('left', 'index'), 'g': ('left', 'index'), 'b': ('left', 'index'),
+    'y': ('right', 'index'), 'h': ('right', 'index'), 'n': ('right', 'index'),
+    'u': ('right', 'index'), 'j': ('right', 'index'), 'm': ('right', 'index'),
+    'i': ('right', 'middle'), 'k': ('right', 'middle'),
+    'o': ('right', 'ring'), 'l': ('right', 'ring'),
+    'p': ('right', 'pinky'),
+}
+
+# Multipliers on the delay before a letter. Switching hands lets one hand get
+# ready while the other types, so it is a little faster. Two different keys on
+# the same finger cannot overlap, so they are a little slower.
+HAND_SWITCH_MULTIPLIER = 0.92
+SAME_FINGER_MULTIPLIER = 1.18
+
+
+def get_finger_timing_multiplier(prev_char, char):
+    """Returns the delay multiplier for typing `char` right after `prev_char`.
+    1.0 means no change. Only letter-to-letter pairs change: spaces, digits,
+    punctuation, and a repeated letter (like the double l in "all") stay 1.0."""
+    if not prev_char or not char:
+        return 1.0
+    prev_letter = prev_char[-1].lower()
+    letter = char[0].lower()
+    if prev_letter == letter:
+        return 1.0
+    prev_finger = FINGER_FOR_LETTER.get(prev_letter)
+    this_finger = FINGER_FOR_LETTER.get(letter)
+    if prev_finger is None or this_finger is None:
+        return 1.0
+    if prev_finger[0] != this_finger[0]:
+        return HAND_SWITCH_MULTIPLIER
+    if prev_finger == this_finger:
+        return SAME_FINGER_MULTIPLIER
+    return 1.0
+
+
+def _build_finger_pair_shifts():
+    """Builds a lookup from a two-letter pair to how far its multiplier is from
+    1.0. The 16 common pairs are left out because they already type at their
+    own fast fixed speed. Used by the time estimate so it stays quick."""
+    shifts = {}
+    for first in FINGER_FOR_LETTER:
+        for second in FINGER_FOR_LETTER:
+            pair = first + second
+            if pair in COMMON_PAIRS:
+                continue
+            shift = get_finger_timing_multiplier(first, second) - 1.0
+            if shift != 0.0:
+                shifts[pair] = shift
+    return shifts
+
+
+FINGER_PAIR_SHIFTS = _build_finger_pair_shifts()
+
+
+def estimate_finger_timing_shift(text):
+    """Adds up how much the finger and hand timing changes the typing time of
+    `text`, counted in average per-character delays (negative means faster)."""
+    lowered = text.lower()
+    return sum(FINGER_PAIR_SHIFTS.get(first + second, 0.0)
+               for first, second in zip(lowered, lowered[1:]))
+
+# --------------------------------------------
+# QWERTY PHYSICAL ADJACENCY (for realistic single-letter typos)
+# --------------------------------------------
+QWERTY_ADJACENCY = {
+    'q': 'wa', 'w': 'qeas', 'e': 'wrds', 'r': 'etdf', 't': 'ryfg', 'y': 'tugh',
+    'u': 'yihj', 'i': 'uojk', 'o': 'ipkl', 'p': 'ol',
+    'a': 'qwsz', 's': 'awedxz', 'd': 'serfcx', 'f': 'drtgvc', 'g': 'ftyhbv',
+    'h': 'gyujnb', 'j': 'huikmn', 'k': 'jiolm', 'l': 'kop',
+    'z': 'asx', 'x': 'zsdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhjm', 'm': 'njk',
+}
+
+# --------------------------------------------
+# PROTECTED-TEXT MARKERS: [[exact text]]
+# --------------------------------------------
+# Wrapping a span of the input file in [[double brackets]] marks it
+# as text that must always type out exactly right -- no adjacent-key
+# typos, no sentence reworks. The brackets themselves are stripped
+# and never typed; only the text inside them is, at the normal
+# per-character delay. Nested brackets aren't supported.
+PROTECTED_MARKER_PATTERN = re.compile(r"\[\[(.*?)\]\]", re.DOTALL)
+
+
+def parse_protected_spans(raw_text):
+    """Strips [[...]] markers out of raw_text, returning the clean
+    text that will actually be typed, plus a list of (start, end)
+    character ranges (indexing into the CLEAN text) that came from
+    inside a marker and must be typed exactly."""
+    clean_parts = []
+    protected_ranges = []
+    last_end = 0
+    clean_pos = 0
+
+    for match in PROTECTED_MARKER_PATTERN.finditer(raw_text):
+        before = raw_text[last_end:match.start()]
+        clean_parts.append(before)
+        clean_pos += len(before)
+
+        inner = match.group(1)
+        protected_ranges.append((clean_pos, clean_pos + len(inner)))
+        clean_parts.append(inner)
+        clean_pos += len(inner)
+
+        last_end = match.end()
+
+    clean_parts.append(raw_text[last_end:])
+    return "".join(clean_parts), protected_ranges
+
+
+def build_protection_mask(length, protected_ranges):
+    mask = [False] * length
+    for start, end in protected_ranges:
+        for i in range(start, min(end, length)):
+            mask[i] = True
+    return mask
+
+
+# --------------------------------------------
+# INLINE PAUSE MARKERS: {{pause:N}}
+# --------------------------------------------
+# Writing {{pause:5}} anywhere in the input file makes Amanuensis wait
+# 5 seconds at that exact spot. The marker itself is never typed.
+# Whole numbers and decimals are allowed (e.g. {{pause:2.5}}). Values
+# above PAUSE_MARKER_MAX_SECONDS are clamped. Anything that looks like
+# a pause marker but has a bad value (e.g. {{pause:abc}}) is NOT removed:
+# it is typed as normal text, and a warning is shown before typing starts.
+#
+# Pause markers are removed first, then [[protected markers]] are
+# parsed. Each pause is stored as a position in the FINAL clean text
+# (the exact text that gets typed), meaning "wait before typing the
+# character at this index". That keeps pauses lined up with resume
+# checkpoints, which also count positions in the clean text.
+PAUSE_MARKER_MAX_SECONDS = 600.0
+PAUSE_MARKER_PATTERN = re.compile(r"\{\{\s*pause\b([^{}]*)\}\}", re.IGNORECASE)
+PAUSE_MARKER_VALUE_PATTERN = re.compile(r"^\s*:\s*([0-9]+(?:\.[0-9]+)?|\.[0-9]+)\s*$")
+
+
+def strip_pause_markers(raw_text):
+    """Removes valid {{pause:N}} markers from raw_text.
+
+    Returns (stripped_text, pause_positions, invalid_markers, clamped_markers):
+    - stripped_text: raw_text with every valid pause marker removed.
+    - pause_positions: dict of {index into stripped_text: total seconds}.
+      A pause at index i means "wait before typing the character at i";
+      i == len(stripped_text) means "wait after the last character".
+    - invalid_markers: marker texts with a bad value. These are left in
+      the text untouched, so they get typed as normal text.
+    - clamped_markers: marker texts whose value was over the maximum and
+      was shortened to PAUSE_MARKER_MAX_SECONDS.
+    """
+    kept_parts = []
+    pause_positions = {}
+    invalid_markers = []
+    clamped_markers = []
+    last_end = 0
+    stripped_length = 0
+
+    for match in PAUSE_MARKER_PATTERN.finditer(raw_text):
+        value_match = PAUSE_MARKER_VALUE_PATTERN.match(match.group(1))
+        if value_match is None:
+            # Bad value: leave it in the text (last_end is not moved).
+            invalid_markers.append(match.group(0))
+            continue
+
+        before = raw_text[last_end:match.start()]
+        kept_parts.append(before)
+        stripped_length += len(before)
+
+        seconds = float(value_match.group(1))
+        if seconds > PAUSE_MARKER_MAX_SECONDS:
+            clamped_markers.append(match.group(0))
+            seconds = PAUSE_MARKER_MAX_SECONDS
+        if seconds > 0:
+            pause_positions[stripped_length] = pause_positions.get(stripped_length, 0.0) + seconds
+
+        last_end = match.end()
+
+    kept_parts.append(raw_text[last_end:])
+    return "".join(kept_parts), pause_positions, invalid_markers, clamped_markers
+
+
+# --------------------------------------------
+# INLINE FORMATTING MARKERS: [[b]]...[[/b]] and [[i]]...[[/i]] (Update #29)
+# --------------------------------------------
+# [[b]] starts bold and [[/b]] ends it. [[i]] and [[/i]] do the same for
+# italic (any capitals work). The markers are never typed. Where one sits,
+# Amanuensis presses Ctrl+B or Ctrl+I, which TOGGLES the style in Google Docs
+# and Word, so a valid pair turns it on and then off again.
+#
+# These are removed BEFORE [[protected markers]] are read, because [[b]] would
+# otherwise look like protected text. That makes these four spellings
+# reserved. Each marker is stored as a position in the FINAL clean text,
+# meaning "press the shortcut before typing the character at this index",
+# exactly like pauses, so it stays in step with resume checkpoints.
+#
+# A marker with no partner is never typed as text. A stray [[/b]] or a
+# repeated [[b]] is ignored, and a style still open at the end of the file is
+# closed after the last character. Each case is reported before typing starts.
+FORMAT_MARKER_PATTERN = re.compile(r"\[\[(/?)([bi])\]\]", re.IGNORECASE)
+FORMAT_KIND_FOR_LETTER = {"b": "bold", "i": "italic"}
+FORMAT_SHORTCUT_LETTER = {"bold": "b", "italic": "i"}
+FORMAT_KIND_ORDER = ("bold", "italic")
+# Average time of one shortcut press (reaching for the keys, then pressing).
+FORMAT_TOGGLE_ESTIMATE_SECONDS = 0.33
+
+
+def shift_position_through_removals(position, removed_spans):
+    """Converts an index in a text to the matching index after the sorted,
+    non-overlapping (start, end) spans were cut out of it."""
+    shift = 0
+    for span_start, span_end in removed_spans:
+        if span_start >= position:
+            break
+        shift += min(span_end, position) - span_start
+    return position - shift
+
+
+def normalize_format_map(format_map):
+    """Cancels a style that is toggled twice at the very same spot (it would
+    press the shortcut twice for no change) and drops empty entries."""
+    cleaned = {}
+    for position, kinds in format_map.items():
+        kept = [kind for kind in dict.fromkeys(kinds) if kinds.count(kind) % 2 == 1]
+        if kept:
+            cleaned[position] = kept
+    return cleaned
+
+
+def strip_format_markers(raw_text):
+    """Removes [[b]], [[/b]], [[i]], and [[/i]] from raw_text.
+
+    Returns (stripped_text, format_positions, removed_spans, problems):
+    - stripped_text: raw_text with every formatting marker removed.
+    - format_positions: {index into stripped_text: [style, ...]} where each
+      style is "bold" or "italic" and means "press that shortcut before the
+      character at this index". An index equal to len(stripped_text) is
+      after the last character (this also holds the automatic close of any
+      style left open).
+    - removed_spans: (start, end) of each marker in raw_text, so other
+      positions can be shifted with shift_position_through_removals().
+    - problems: plain-English notes about markers that have no partner."""
+    kept_parts = []
+    format_positions = {}
+    removed_spans = []
+    problems = []
+    open_markers = {}  # style -> the marker text that opened it
+    last_end = 0
+    stripped_length = 0
+
+    for match in FORMAT_MARKER_PATTERN.finditer(raw_text):
+        before = raw_text[last_end:match.start()]
+        kept_parts.append(before)
+        stripped_length += len(before)
+        removed_spans.append((match.start(), match.end()))
+        last_end = match.end()
+
+        marker_text = match.group(0)
+        is_closing = match.group(1) == "/"
+        kind = FORMAT_KIND_FOR_LETTER[match.group(2).lower()]
+        if is_closing:
+            if kind not in open_markers:
+                problems.append(f"{marker_text}  (no matching opening marker, ignored)")
+                continue
+            del open_markers[kind]
+        else:
+            if kind in open_markers:
+                problems.append(f"{marker_text}  ({kind} is already on, ignored)")
+                continue
+            open_markers[kind] = marker_text
+        format_positions.setdefault(stripped_length, []).append(kind)
+
+    tail = raw_text[last_end:]
+    kept_parts.append(tail)
+    stripped_length += len(tail)
+
+    for kind in FORMAT_KIND_ORDER:
+        if kind in open_markers:
+            problems.append(f"{open_markers[kind]}  (never closed, will be turned off after the last character)")
+            format_positions.setdefault(stripped_length, []).append(kind)
+
+    return "".join(kept_parts), normalize_format_map(format_positions), removed_spans, problems
+
+
+def parse_input_markers(raw_text, enable_pause_markers=True):
+    """Parses every marker type in the input file in one place.
+
+    Returns (clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers):
+    - clean_text: the exact text that will be typed (no markers left in it).
+    - protected_ranges: (start, end) ranges in clean_text for [[protected text]].
+    - pause_map: {index into clean_text: seconds to wait before typing that
+      character}. An index equal to len(clean_text) is a pause at the very end.
+    - format_map: {index into clean_text: ["bold" or "italic", ...]} shortcuts
+      to press before typing that character (see strip_format_markers()).
+    When enable_pause_markers is False, {{pause:N}} is left in the text and
+    typed like any other text. Formatting markers are always removed from the
+    text (the caller decides whether to press the shortcuts)."""
+    if enable_pause_markers:
+        stripped, stripped_pauses, invalid_markers, clamped_markers = strip_pause_markers(raw_text)
+    else:
+        stripped, stripped_pauses, invalid_markers, clamped_markers = raw_text, {}, [], []
+
+    # Formatting markers go before [[protected markers]] are read. Pause
+    # positions so far point into the text with the formatting markers still
+    # in it, so shift them to match.
+    stripped, format_positions, format_removed_spans, _format_problems = strip_format_markers(stripped)
+    if format_removed_spans and stripped_pauses:
+        shifted_pauses = {}
+        for position, seconds in stripped_pauses.items():
+            new_position = shift_position_through_removals(position, format_removed_spans)
+            shifted_pauses[new_position] = shifted_pauses.get(new_position, 0.0) + seconds
+        stripped_pauses = shifted_pauses
+
+    clean_text, protected_ranges = parse_protected_spans(stripped)
+
+    # Pause and format positions so far point into `stripped`, which still has
+    # the [[ and ]] characters in it. Shift each one left by however many
+    # bracket characters sit before it, so it points into clean_text.
+    pause_map = {}
+    format_map = {}
+    if stripped_pauses or format_positions:
+        bracket_spans = []
+        for match in PROTECTED_MARKER_PATTERN.finditer(stripped):
+            bracket_spans.append((match.start(), match.start() + 2))
+            bracket_spans.append((match.end() - 2, match.end()))
+
+        for position, seconds in stripped_pauses.items():
+            clean_position = shift_position_through_removals(position, bracket_spans)
+            pause_map[clean_position] = pause_map.get(clean_position, 0.0) + seconds
+        for position, kinds in format_positions.items():
+            clean_position = shift_position_through_removals(position, bracket_spans)
+            format_map.setdefault(clean_position, []).extend(kinds)
+
+    return clean_text, protected_ranges, pause_map, normalize_format_map(format_map), invalid_markers, clamped_markers
+
+
+# --------------------------------------------
+# READING INPUT FILES: .txt, .md, AND .docx (Update #55)
+# --------------------------------------------
+# Every place that opens an input file goes through read_input_file_text(), so
+# the time estimate, the preview, the typing run, and resume checks always see
+# the exact same text.
+#   .txt (and any other extension)  read as plain UTF-8 text, like always.
+#   .md / .markdown                 **bold** and *italic* become the [[b]] and
+#                                   [[i]] formatting markers. Nothing else in
+#                                   the file changes: headings, lists, links,
+#                                   and code are typed exactly as written.
+#   .docx                           plain text only. Paragraphs, line breaks,
+#                                   and tabs are kept. Fonts, bold, italic,
+#                                   pictures, list numbers, headers, and
+#                                   footnotes are left out.
+# The .docx reader uses only the standard library (zipfile and re), so no new
+# package is needed. A .docx is untrusted input: its size is capped, and only
+# the one text part is read.
+MARKDOWN_EXTENSIONS = (".md", ".markdown")
+DOCX_EXTENSION = ".docx"
+DOCX_MAX_FILE_BYTES = 25 * 1024 * 1024
+DOCX_MAX_XML_BYTES = 50 * 1024 * 1024
+DOCX_BODY_PART = "word/document.xml"
+# What the Browse and Add Files pickers show first.
+INPUT_FILE_TYPES = [
+    ("Text, Markdown, and Word files", ("*.txt", "*.md", "*.markdown", "*.docx")),
+    ("Text files", "*.txt"),
+    ("Markdown files", ("*.md", "*.markdown")),
+    ("Word files", "*.docx"),
+    ("All files", "*.*"),
+]
+
+# The text, tab, line break, and paragraph end tags inside a Word document.
+# <w:t> holds typed text. <w:delText> (deleted text) is a different tag, so
+# tracked deletions are left out on their own.
+DOCX_TOKEN_PATTERN = re.compile(
+    r"<w:t(?:\s[^>]*)?>(?P<text>.*?)</w:t>"
+    r"|(?P<tab><w:tab\s*/>)"
+    r"|(?P<break><w:(?:br|cr)(?:\s[^>]*)?/>)"
+    r"|(?P<end></w:p>|<w:p(?:\s[^>]*)?/>)",
+    re.DOTALL,
+)
+# Word can store a text box twice (a real copy and a plain fallback copy).
+DOCX_FALLBACK_PATTERN = re.compile(r"<mc:Fallback>.*?</mc:Fallback>", re.DOTALL)
+
+# Markdown emphasis. Each pattern stays on one line, wants a non-space letter
+# just inside each mark, and wants a non-word character just outside it, so
+# "2 * 3 * 4", "snake_case_name", "a*b*c", and "* bullet" are left alone. A
+# mark with a backslash before it (\*) is a plain character.
+MARKDOWN_BOLD_ITALIC_PATTERN = re.compile(
+    r"(?<![\w\\*])\*\*\*(?=[^\s*])(.+?)(?<=[^\s*\\])\*\*\*(?![\w*])"
+)
+MARKDOWN_BOLD_PATTERNS = (
+    re.compile(r"(?<![\w\\*])\*\*(?=[^\s*])(.+?)(?<=[^\s*\\])\*\*(?![\w*])"),
+    re.compile(r"(?<![\w\\_])__(?=[^\s_])(.+?)(?<=[^\s_\\])__(?![\w_])"),
+)
+MARKDOWN_ITALIC_PATTERNS = (
+    re.compile(r"(?<![\w\\*])\*(?=[^\s*])(.+?)(?<=[^\s*\\])\*(?![\w*])"),
+    re.compile(r"(?<![\w\\_])_(?=[^\s_])(.+?)(?<=[^\s_\\])_(?![\w_])"),
+)
+MARKDOWN_ESCAPED_MARK_PATTERN = re.compile(r"\\([*_])")
+MARKDOWN_HOLD_PATTERN = re.compile("\x00(\\d+)\x00")
+
+
+def convert_markdown_emphasis(raw_text):
+    """Turns **bold** and *italic* (also __bold__ and _italic_) in Markdown
+    text into the [[b]]...[[/b]] and [[i]]...[[/i]] formatting markers.
+    ***both*** gives both styles. Every other character stays as it is.
+
+    Any [[...]] span (protected text or a marker the person already wrote) is
+    set aside first and put back untouched, so protected text never changes.
+    A mark with no partner on its line is left as a plain character."""
+    held_spans = []
+
+    def hold_span(match):
+        held_spans.append(match.group(0))
+        return f"\x00{len(held_spans) - 1}\x00"
+
+    # A stray null character cannot be told apart from a held span, so it is
+    # dropped (a real text file never has one).
+    text = raw_text.replace("\x00", "")
+    text = PROTECTED_MARKER_PATTERN.sub(hold_span, text)
+
+    text = MARKDOWN_BOLD_ITALIC_PATTERN.sub(r"[[b]][[i]]\1[[/i]][[/b]]", text)
+    for pattern in MARKDOWN_BOLD_PATTERNS:
+        text = pattern.sub(r"[[b]]\1[[/b]]", text)
+    for pattern in MARKDOWN_ITALIC_PATTERNS:
+        text = pattern.sub(r"[[i]]\1[[/i]]", text)
+
+    text = MARKDOWN_ESCAPED_MARK_PATTERN.sub(r"\1", text)
+    return MARKDOWN_HOLD_PATTERN.sub(lambda m: held_spans[int(m.group(1))], text)
+
+
+def extract_docx_paragraph_text(body_xml):
+    """Pulls the plain text out of the text part of a Word file. Each paragraph
+    becomes one line, <w:br/> becomes a line break, and <w:tab/> becomes a tab.
+    Blank lines at the very end are dropped."""
+    body_xml = DOCX_FALLBACK_PATTERN.sub("", body_xml)
+    pieces = []
+    for match in DOCX_TOKEN_PATTERN.finditer(body_xml):
+        if match.group("text") is not None:
+            pieces.append(html.unescape(match.group("text")))
+        elif match.group("tab"):
+            pieces.append("\t")
+        else:
+            # A line break, or the end of a paragraph (also an empty <w:p/>).
+            pieces.append("\n")
+    return "".join(pieces).rstrip("\n")
+
+
+def read_docx_text(path):
+    """Reads a Word (.docx) file as plain text. Raises OSError with a plain
+    message when the file is missing, too big, or not a real .docx, so every
+    caller's existing `except OSError` handles it."""
+    if os.path.getsize(path) > DOCX_MAX_FILE_BYTES:
+        raise OSError("This Word file is too big (over 25 MB).")
+    try:
+        with zipfile.ZipFile(path) as docx_zip:
+            part_info = docx_zip.getinfo(DOCX_BODY_PART)
+            if part_info.file_size > DOCX_MAX_XML_BYTES:
+                raise OSError("The text inside this Word file is too big to read.")
+            with docx_zip.open(part_info) as part_file:
+                body_bytes = part_file.read(DOCX_MAX_XML_BYTES + 1)
+    except (zipfile.BadZipFile, KeyError, RuntimeError, NotImplementedError, EOFError, zlib.error):
+        raise OSError("This is not a Word (.docx) file that can be read. "
+                      "A password-protected or damaged file cannot be opened.") from None
+    if len(body_bytes) > DOCX_MAX_XML_BYTES:
+        raise OSError("The text inside this Word file is too big to read.")
+    return extract_docx_paragraph_text(body_bytes.decode("utf-8", errors="replace"))
+
+
+def read_input_file_text(path):
+    """Reads an input file and returns the text to type. The ONE function that
+    opens input files: .docx gives plain text, .md/.markdown has its bold and
+    italic turned into formatting markers, and anything else is plain UTF-8."""
+    extension = os.path.splitext(path)[1].lower()
+    if extension == DOCX_EXTENSION:
+        return read_docx_text(path)
+    with open(path, "r", encoding="utf-8") as input_file:
+        raw_text = input_file.read()
+    if extension in MARKDOWN_EXTENSIONS:
+        return convert_markdown_emphasis(raw_text)
+    return raw_text
+
+
+# --------------------------------------------
+# SMART TEXT FIXES (Update #22)
+# --------------------------------------------
+# A local, rule-based "proofreading" pass over the text that is about to
+# be typed. It never uses AI or the internet: every decision comes from
+# the plain rules below, so the same text and settings always produce
+# exactly the same result.
+#
+# What it can fix (each group can be turned on or off):
+#   spacing         extra spaces, trailing spaces, a space before , . ; : ! ?
+#                   and a missing space after , . ; ! ?
+#   punctuation     a missing comma after openers like "However", a missing
+#                   period at the end of a paragraph, doubled punctuation
+#   capitalization  the first letter of a sentence, and a lowercase "i"
+#   repeated_words  an accidental repeat such as "the the"
+#
+# Safety rules (do not weaken these):
+#   * Text inside [[protected markers]] is NEVER changed. A fix is skipped if
+#     it would touch a protected character or squeeze in right next to one.
+#   * Rules are deliberately cautious. When a spot looks like a web address,
+#     email, file path, code, an abbreviation or a list number, it is left alone.
+#   * Rules are written for English punctuation and spacing.
+#   * Everything is worked out BEFORE typing starts and is fully repeatable,
+#     so resume-from-checkpoint positions stay in line with the fixed text.
+#   * If anything unexpected goes wrong, prepare_input_text() falls back to
+#     the original text instead of risking a wrong result.
+#
+# Fixes are planned as SmartFix edits against the clean text (markers already
+# removed). They are applied together, and every position that points into
+# the text (protected ranges, pause markers) is shifted to match.
+# During typing, a fix can also be "acted out": the typer first makes the
+# slip (for example types a stray space), pauses as if noticing it, backspaces
+# it, and carries on. The final text on screen is the same either way.
+
+SMART_FIX_LABELS = {
+    "extra_space": "Removed an extra space",
+    "trailing_space": "Removed a space at the end of a line",
+    "space_before_punct": "Removed a space before punctuation",
+    "missing_space": "Added a missing space after punctuation",
+    "missing_comma": "Added a missing comma after an opening word",
+    "missing_period": "Added a missing period at the end of a paragraph",
+    "double_punct": "Removed doubled punctuation",
+    "capitalization": "Fixed a capital letter",
+    "repeated_word": "Removed a repeated word",
+}
+
+# Characters that make a chunk of text look like a web address, email, file
+# path, or code. Punctuation rules leave those chunks alone.
+SMART_TECHNICAL_CHARS = set("/\\=@&#%_~^|<>{}")
+SMART_TRAILING_PUNCT = ",.;:!?)\"'\u201d\u2019"
+
+# Words that are allowed to appear twice in a row ("had had", "that that").
+SMART_REPEAT_OK = {"had", "that", "is", "do", "no", "very", "so", "ha", "oh", "bye", "yeah", "knock", "blah"}
+
+# Sentence-opening words and phrases that normally take a comma after them.
+SMART_INTRO_PHRASES = (
+    "however", "therefore", "moreover", "furthermore", "additionally", "consequently",
+    "nevertheless", "nonetheless", "meanwhile", "unfortunately", "fortunately", "honestly",
+    "basically", "overall", "ultimately", "similarly", "likewise", "specifically",
+    "generally", "accordingly", "otherwise", "instead", "finally", "firstly", "secondly",
+    "thirdly", "lastly", "initially", "eventually", "obviously",
+    "for example", "for instance", "in addition", "in conclusion", "in summary",
+    "in fact", "in general", "in particular", "as a result", "on the other hand",
+    "of course", "in other words", "by the way", "at the same time", "after all",
+    "in the meantime",
+)
+SMART_INTRO_PATTERN = re.compile(
+    "(?:" + "|".join(sorted((re.escape(p) for p in SMART_INTRO_PHRASES), key=len, reverse=True)) + ")(?= )",
+    re.IGNORECASE,
+)
+# A comma is only added when the word AFTER the opener is one of these. That
+# keeps "However hard I try" and "Overall quality" (no comma needed) alone.
+SMART_INTRO_NEXT_WORDS = {
+    "i", "we", "you", "he", "she", "they", "it", "the", "a", "an", "this", "that",
+    "these", "those", "there", "my", "our", "your", "his", "her", "their", "its",
+    "some", "many", "most", "all", "one", "no", "not", "every", "each", "if",
+    "when", "as", "in", "on", "at", "for", "with", "after", "before", "because",
+    "since", "although", "while",
+}
+
+# Words that end in a period without ending the sentence.
+SMART_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "inc", "ltd", "co",
+    "no", "fig", "approx", "dept", "est", "gen", "sen", "rep", "vol", "jan", "feb",
+    "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+}
+
+# Lowercase roman numerals, which start list items like "ii. second point".
+SMART_ROMAN_NUMERALS = {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"}
+
+SMART_RUN_OF_SPACES = re.compile(r" +")
+SMART_COMMA_RUN = re.compile(r",{2,}|;{2,}")
+SMART_TWO_DOTS = re.compile(r"(?<!\.)\.\.(?!\.)")
+SMART_SENTENCE_BREAK = re.compile(r"([.!?]+)[\"'\u201d\u2019)\]]*\s+|\n+")
+SMART_REPEATED_WORD = re.compile(
+    r"(?<![\w'\u2019])([A-Za-z][A-Za-z'\u2019]*)((?: \1)+)(?![\w'\u2019])", re.IGNORECASE
+)
+SMART_LONE_I = re.compile(r"(?<![\w'\u2019.\-/\\@])i(?=[\s,;!?]|['\u2019][A-Za-z]|$)")
+SMART_WORD_LETTERS = re.compile(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)?")
+SMART_NEXT_WORD = re.compile(r"[A-Za-z]+")
+
+
+class SmartFix:
+    """One planned change to the clean text: replace text[start:end] with
+    `replacement`. start == end means an insertion; an empty replacement
+    means a deletion. `wrong_text` is what the typer briefly types by
+    "mistake" when it acts the fix out (None means no visible version)."""
+
+    __slots__ = ("kind", "start", "end", "replacement", "wrong_text")
+
+    def __init__(self, kind, start, end, replacement, wrong_text=None):
+        self.kind = kind
+        self.start = start
+        self.end = end
+        self.replacement = replacement
+        self.wrong_text = wrong_text
+
+
+class PreparedText:
+    """Everything type_text() and the estimate/resume code need to know
+    about one input file, after markers and smart fixes are handled.
+    All positions refer to clean_text (the exact text that gets typed)."""
+
+    def __init__(self, clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers):
+        self.clean_text = clean_text
+        self.protected_ranges = protected_ranges
+        self.pause_map = pause_map
+        self.format_map = format_map    # {index in clean_text: ["bold" / "italic", ...]} (Update #29)
+        self.invalid_markers = invalid_markers
+        self.clamped_markers = clamped_markers
+        self.source_text = clean_text   # the text before smart fixes
+        self.fixes = []                 # SmartFix list (positions in source_text)
+        self.fix_actions = {}           # {index in clean_text: [(kind, wrong_text), ...]}
+
+
+def get_smart_fix_options(settings, ignore_master=False):
+    """Returns which fix groups are on, or None when smart fixes are off
+    (or every group is off). ignore_master=True is used by the review
+    window, which shows what WOULD change even while the master switch is off."""
+    if not ignore_master and not settings.get("enable_smart_fixes", False):
+        return None
+    options = {
+        "spacing": bool(settings.get("smart_fix_spacing", True)),
+        "punctuation": bool(settings.get("smart_fix_punctuation", True)),
+        "capitalization": bool(settings.get("smart_fix_capitalization", True)),
+        "repeated_words": bool(settings.get("smart_fix_repeated_words", True)),
+    }
+    if not any(options.values()):
+        return None
+    return options
+
+
+def _smart_token_around(text, index):
+    """Returns the chunk of text (no whitespace inside) that contains the
+    character at `index`."""
+    start = index
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    end = index
+    while end < len(text) and not text[end].isspace():
+        end += 1
+    return text[start:end]
+
+
+def _smart_looks_technical(token):
+    """True for chunks that look like web addresses, emails, paths or code."""
+    lowered = token.lower()
+    if lowered.startswith(("www.", "http")):
+        return True
+    return any(char in SMART_TECHNICAL_CHARS for char in token)
+
+
+def _smart_space_before_punct_ok(text, run_start, run_end):
+    """Decides whether a run of spaces right before , . ; : ! ? is a stray
+    space (True) or something to leave alone, like an ellipsis, a smiley,
+    or a file extension (False)."""
+    previous_char = text[run_start - 1]
+    if not (previous_char.isalnum() or previous_char in "\"'\u201d\u2019)]"):
+        return False
+    punct = text[run_end]
+    after = text[run_end + 1] if run_end + 1 < len(text) else ""
+    if after and not (after.isspace() or after in "\"'\u201d\u2019"):
+        return False
+    if punct == "." and after == ".":
+        return False
+    return True
+
+
+def _smart_comma_glued_to_next_word(text, run_start, run_end):
+    """True for 'word ,next': a comma with a space before it and a letter
+    right after it, in text that is not a web address, path, or code."""
+    if not text[run_start - 1].isalpha():
+        return False
+    if run_end + 1 >= len(text) or not text[run_end + 1].isalpha():
+        return False
+    return not _smart_looks_technical(_smart_token_around(text, run_end))
+
+
+def _find_space_fixes(text):
+    fixes = []
+    for match in SMART_RUN_OF_SPACES.finditer(text):
+        start, end = match.start(), match.end()
+        if start == 0 or text[start - 1] == "\n":
+            continue  # indentation is left alone
+        next_char = text[end] if end < len(text) else ""
+        if next_char == "" or next_char == "\n":
+            fixes.append(SmartFix("trailing_space", start, end, "", text[start:end][:3]))
+        elif next_char in ",.;:!?" and _smart_space_before_punct_ok(text, start, end):
+            fixes.append(SmartFix("space_before_punct", start, end, "", text[start:end][:3]))
+        elif next_char == "," and _smart_comma_glued_to_next_word(text, start, end):
+            # "word ,next" becomes "word, next": drop the stray space and add the missing one.
+            fixes.append(SmartFix("space_before_punct", start, end, "", text[start:end][:3]))
+            fixes.append(SmartFix("missing_space", end + 1, end + 1, " ", text[end + 1]))
+        elif end - start >= 2:
+            fixes.append(SmartFix("extra_space", start + 1, end, "", text[start + 1:end][:3]))
+    return fixes
+
+
+def _find_missing_space_fixes(text):
+    fixes = []
+    for index in range(1, len(text) - 1):
+        char = text[index]
+        if char not in ",.;!?":
+            continue
+        previous_char = text[index - 1]
+        next_char = text[index + 1]
+        if not (previous_char.isalpha() and next_char.isalpha()):
+            continue
+        token = _smart_token_around(text, index)
+        if _smart_looks_technical(token):
+            continue
+        if char == ".":
+            # Only "word.Name" (a lowercase word, then a capitalized word).
+            if not previous_char.islower():
+                continue
+            if not (next_char.isupper() and index + 2 < len(text) and text[index + 2].islower()):
+                continue
+            if token.rstrip(SMART_TRAILING_PUNCT).count(".") > 1:
+                continue  # initials or dotted names such as U.S.A
+            run_start = index - 1
+            while run_start >= 0 and text[run_start].isalpha():
+                run_start -= 1
+            if index - 1 - run_start < 2:
+                continue  # a single letter before the dot, like an initial
+            if run_start >= 0 and text[run_start].isdigit():
+                continue
+        fixes.append(SmartFix("missing_space", index + 1, index + 1, " ", next_char))
+    return fixes
+
+
+def _find_double_punct_fixes(text):
+    fixes = []
+    for match in SMART_COMMA_RUN.finditer(text):
+        fixes.append(SmartFix("double_punct", match.start() + 1, match.end(), "", match.group(0)[1:3]))
+    for match in SMART_TWO_DOTS.finditer(text):
+        if _smart_looks_technical(_smart_token_around(text, match.start())):
+            continue
+        fixes.append(SmartFix("double_punct", match.start() + 1, match.end(), "", "."))
+    return fixes
+
+
+def _smart_sentence_starts(text, include_glued=False):
+    """Returns (index, after_period, previous_token) for the start of the
+    text, every line, and every sentence. after_period is the sentence-ending
+    punctuation that came just before (or "" for the start of a line/text).
+    With include_glued=True, a sentence that is glued to the one before it
+    ("done.Then") also counts, because the space fix is about to separate them."""
+    starts = [(0, "", "")]
+    for match in SMART_SENTENCE_BREAK.finditer(text):
+        punct = match.group(1) or ""
+        previous_token = ""
+        if punct:
+            before = text[max(0, match.start() - 40):match.start()].split()
+            previous_token = before[-1] if before else ""
+        starts.append((match.end(), punct, previous_token))
+    if include_glued:
+        for fix in _find_missing_space_fixes(text):
+            punct = text[fix.start - 1]
+            if punct not in ".!?":
+                continue
+            before = text[max(0, fix.start - 41):fix.start - 1].split()
+            starts.append((fix.start, punct, before[-1] if before else ""))
+    return starts
+
+
+def _smart_skip_openers(text, index):
+    while index < len(text) and text[index] in "\"'\u201c\u2018([":
+        index += 1
+    return index
+
+
+def _find_intro_comma_fixes(text, include_glued=False):
+    fixes = []
+    seen = set()
+    for raw_index, _punct, _previous in _smart_sentence_starts(text, include_glued):
+        index = _smart_skip_openers(text, raw_index)
+        if index in seen or index >= len(text):
+            continue
+        seen.add(index)
+        match = SMART_INTRO_PATTERN.match(text, index)
+        if match is None:
+            continue
+        next_word = SMART_NEXT_WORD.match(text, match.end() + 1)
+        if next_word is None or next_word.group(0).lower() not in SMART_INTRO_NEXT_WORDS:
+            continue
+        fixes.append(SmartFix("missing_comma", match.end(), match.end(), ",", " "))
+    return fixes
+
+
+def _find_final_period_fixes(text):
+    """Adds a period to a long paragraph that has none. To avoid breaking
+    text that was hard-wrapped (lines cut mid-sentence), only a line that
+    is followed by a blank line, or is the last line of the file, counts."""
+    fixes = []
+    lines = text.split("\n")
+    position = 0
+    for line_number, line in enumerate(lines):
+        line_start = position
+        position += len(line) + 1
+        trimmed = line.rstrip(" ")
+        if not trimmed or len(trimmed.split()) < 8:
+            continue
+        is_last_line = line_number == len(lines) - 1
+        if not is_last_line and lines[line_number + 1].strip():
+            continue
+        first_char = trimmed.lstrip(" ")[0]
+        if not first_char.isalpha() or not trimmed[-1].isalnum() or trimmed.isupper():
+            continue
+        if _smart_looks_technical(trimmed.split()[-1]):
+            continue
+        insert_at = line_start + len(trimmed)
+        fixes.append(SmartFix("missing_period", insert_at, insert_at, ".", None))
+    return fixes
+
+
+def _smart_starts_plain_word(text, index):
+    """True when a plain all-lowercase word starts at `index`, followed by a
+    space, the end, or ordinary punctuation. This leaves alone brand names
+    (eBay), web addresses, code, file names, and list markers such as
+    "a." or "ii."."""
+    word_match = SMART_WORD_LETTERS.match(text, index)
+    if word_match is None:
+        return False
+    word = word_match.group(0)
+    if word != word.lower():
+        return False
+    after = text[word_match.end()] if word_match.end() < len(text) else ""
+    after_after = text[word_match.end() + 1] if word_match.end() + 1 < len(text) else ""
+    if after == ".":
+        if len(word) == 1 or word in SMART_ROMAN_NUMERALS:
+            return False  # list marker or initial, like "a." or "ii."
+        if after_after.isalnum():
+            return False  # a dotted name such as e.g. or example.com
+    elif after == "-":
+        if not after_after.isalpha():
+            return False
+    elif after and not (after.isspace() or after in ",;:!?)\"'\u201d\u2019"):
+        return False
+    return not _smart_looks_technical(_smart_token_around(text, index))
+
+
+def _find_capitalization_fixes(text, include_glued=False):
+    fixes = []
+    for raw_index, punct, previous_token in _smart_sentence_starts(text, include_glued):
+        index = _smart_skip_openers(text, raw_index)
+        if index >= len(text) or not text[index].islower():
+            continue
+        if punct:
+            if "." in punct and punct != ".":
+                continue  # ellipsis: lowercase after it is usually on purpose
+            lowered_token = previous_token.lower().strip("(\"'\u201c\u2018[")
+            if punct == ".":
+                if (lowered_token in SMART_ABBREVIATIONS or lowered_token in SMART_ROMAN_NUMERALS
+                        or len(lowered_token) == 1 or "." in lowered_token):
+                    continue
+                if lowered_token.isdigit() and len(lowered_token) <= 2:
+                    continue  # list numbers like "1. item"
+                if any(char.isdigit() for char in lowered_token) and not lowered_token.isdigit():
+                    continue
+        elif raw_index > 0:
+            # A new line (not a new sentence). Only capitalize when the line
+            # before it ended a sentence or was blank, so hard-wrapped text
+            # that continues mid-sentence is never touched.
+            before_break = text[:raw_index].rstrip("\n")
+            ended_sentence = before_break == "" or text[:raw_index].endswith("\n\n") or \
+                before_break.rstrip("\"'\u201d\u2019)]")[-1:] in (".", "!", "?")
+            if not ended_sentence:
+                continue
+        if not _smart_starts_plain_word(text, index):
+            continue
+        fixes.append(SmartFix("capitalization", index, index + 1, text[index].upper(), text[index]))
+
+    for match in SMART_LONE_I.finditer(text):
+        if _smart_looks_technical(_smart_token_around(text, match.start())):
+            continue
+        fixes.append(SmartFix("capitalization", match.start(), match.start() + 1, "I", "i"))
+    return fixes
+
+
+def _find_repeated_word_fixes(text):
+    fixes = []
+    for match in SMART_REPEATED_WORD.finditer(text):
+        word = match.group(1)
+        if word.lower() in SMART_REPEAT_OK:
+            continue
+        if _smart_looks_technical(_smart_token_around(text, match.start())):
+            continue
+        repeat_start = match.end(1)
+        fixes.append(SmartFix("repeated_word", repeat_start, match.end(2), "", " " + word))
+    return fixes
+
+
+def _smart_fix_is_allowed(fix, protection_mask):
+    """A fix may never delete or replace a protected character, and an
+    insertion may not sit directly beside one."""
+    length = len(protection_mask)
+    if fix.start == fix.end:
+        if fix.start > 0 and protection_mask[fix.start - 1]:
+            return False
+        if fix.start < length and protection_mask[fix.start]:
+            return False
+        return True
+    return not any(protection_mask[fix.start:fix.end])
+
+
+def find_smart_fixes(text, protection_mask, options):
+    """Plans every fix for `text`. Returns a list of SmartFix edits, sorted by
+    position, none overlapping each other, none touching protected text."""
+    planned = []
+    if options.get("spacing"):
+        planned += _find_space_fixes(text)
+        planned += _find_missing_space_fixes(text)
+    if options.get("punctuation"):
+        planned += _find_intro_comma_fixes(text, options.get("spacing", False))
+        planned += _find_final_period_fixes(text)
+        planned += _find_double_punct_fixes(text)
+    if options.get("capitalization"):
+        planned += _find_capitalization_fixes(text, options.get("spacing", False))
+    if options.get("repeated_words"):
+        planned += _find_repeated_word_fixes(text)
+
+    planned.sort(key=lambda fix: (fix.start, fix.end))
+    accepted = []
+    for fix in planned:
+        if not _smart_fix_is_allowed(fix, protection_mask):
+            continue
+        if accepted:
+            last = accepted[-1]
+            if fix.start < last.end:
+                continue  # overlaps an earlier fix
+            if fix.start == fix.end == last.start == last.end:
+                continue  # two insertions at the very same spot
+        accepted.append(fix)
+    return accepted
+
+
+def apply_smart_fixes(text, fixes):
+    """Applies the fixes (sorted, non-overlapping) to `text`. Returns
+    (new_text, new_starts) where new_starts[i] is the index in new_text
+    where fixes[i]'s replacement begins."""
+    pieces = []
+    new_starts = []
+    position = 0
+    shift = 0
+    for fix in fixes:
+        pieces.append(text[position:fix.start])
+        new_starts.append(fix.start + shift)
+        pieces.append(fix.replacement)
+        shift += len(fix.replacement) - (fix.end - fix.start)
+        position = fix.end
+    pieces.append(text[position:])
+    return "".join(pieces), new_starts
+
+
+def map_position_through_fixes(position, fixes):
+    """Converts an index in the old text to the matching index in the fixed
+    text. A position that sat inside deleted text moves to where that
+    deleted text used to be."""
+    shift = 0
+    for fix in fixes:
+        if fix.end <= position:
+            shift += len(fix.replacement) - (fix.end - fix.start)
+        elif fix.start < position:
+            return fix.start + shift + len(fix.replacement)
+        else:
+            break
+    return position + shift
+
+
+def build_fix_actions(fixes, new_starts):
+    """Builds {index in fixed text: [(kind, wrong_text), ...]}. When the
+    typer reaches that index it may act the fix out by typing wrong_text,
+    pausing, and backspacing it before typing the real character."""
+    actions = {}
+    for fix, new_start in zip(fixes, new_starts):
+        if not fix.wrong_text:
+            continue
+        actions.setdefault(new_start, []).append((fix.kind, fix.wrong_text))
+    return actions
+
+
+def summarize_smart_fixes(fixes):
+    """A short, text-free summary for the session log, such as
+    '3 fixes: capitalization=2, extra_space=1'."""
+    counts = {}
+    for fix in fixes:
+        counts[fix.kind] = counts.get(fix.kind, 0) + 1
+    parts = ", ".join(f"{kind}={count}" for kind, count in sorted(counts.items()))
+    return f"{len(fixes)} fixes: {parts}" if fixes else "no fixes"
+
+
+def prepare_input_text(raw_text, settings):
+    """Turns the raw file text into everything needed to type it: strips
+    the markers, then (when smart fixes are on) applies them. This is the
+    one place every caller goes through, so typing, estimates, and resume
+    checks always agree on exactly what the text is."""
+    clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers = parse_input_markers(
+        raw_text, settings.get("enable_pause_markers", True)
+    )
+    if not settings.get("enable_format_markers", True):
+        # The markers are still removed from the text, but no shortcuts get pressed.
+        format_map = {}
+    prepared = PreparedText(clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers)
+
+    options = get_smart_fix_options(settings)
+    if options is None or not clean_text:
+        return prepared
+
+    try:
+        protection_mask = build_protection_mask(len(clean_text), protected_ranges)
+        fixes = find_smart_fixes(clean_text, protection_mask, options)
+        if not fixes:
+            return prepared
+
+        new_text, new_starts = apply_smart_fixes(clean_text, fixes)
+
+        new_ranges = []
+        for range_start, range_end in protected_ranges:
+            new_start = map_position_through_fixes(range_start, fixes)
+            new_end = map_position_through_fixes(range_end, fixes)
+            # Safety net: protected text must come out exactly as it went in.
+            if clean_text[range_start:range_end] != new_text[new_start:new_end]:
+                return prepared
+            new_ranges.append((new_start, new_end))
+
+        new_pause_map = {}
+        for pause_position, seconds in pause_map.items():
+            new_position = map_position_through_fixes(pause_position, fixes)
+            new_pause_map[new_position] = new_pause_map.get(new_position, 0.0) + seconds
+
+        new_format_map = {}
+        for format_position, kinds in format_map.items():
+            new_position = map_position_through_fixes(format_position, fixes)
+            new_format_map.setdefault(new_position, []).extend(kinds)
+
+        prepared.clean_text = new_text
+        prepared.protected_ranges = new_ranges
+        prepared.pause_map = new_pause_map
+        prepared.format_map = normalize_format_map(new_format_map)
+        prepared.fixes = fixes
+        prepared.fix_actions = build_fix_actions(fixes, new_starts)
+    except Exception:
+        # Default to safety: if the fixer ever fails, type the original text.
+        return PreparedText(clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers)
+    return prepared
+
+
+def describe_smart_fix(source_text, fix, context=24):
+    """Returns (line_number, label, before_snippet, after_snippet) for the
+    review window. The changed part is wrapped in angle quotes, spaces inside it
+    are shown as dots, and line breaks as arrows, so tiny changes are visible."""
+    window_start = max(0, fix.start - context)
+    window_end = min(len(source_text), fix.end + context)
+
+    def show(piece):
+        return piece.replace("\n", "\u21b5")
+
+    def show_changed(piece):
+        return piece.replace(" ", "\u00b7").replace("\n", "\u21b5")
+
+    head = show(source_text[window_start:fix.start])
+    tail = show(source_text[fix.end:window_end])
+    before = f"{head}\u00ab{show_changed(source_text[fix.start:fix.end])}\u00bb{tail}"
+    after = f"{head}\u00ab{show_changed(fix.replacement)}\u00bb{tail}"
+    line_number = source_text.count("\n", 0, fix.start) + 1
+    return line_number, SMART_FIX_LABELS.get(fix.kind, fix.kind), before, after
+
+
+# --------------------------------------------
+# LEAVE MISTAKES FOR ME (Update #24)
+# --------------------------------------------
+# An optional mode that purposely leaves a few mistakes in the typed text so
+# the person can go back and fix them by hand. It is the opposite of Smart
+# Text Fixes. The mistakes are chosen BEFORE typing starts. Each one is a
+# small edit of the typed text (for example "type 'teh' instead of 'the'"),
+# and the clean text itself never changes, so resume positions, protected
+# text, and pause markers all stay lined up.
+#
+# Kinds of mistakes (three on/off groups):
+#   typos         wrong letter (a neighboring key), swapped letters, doubled
+#                 letter, missing letter, a wrong capital letter, and two
+#                 words run together
+#   commas        a comma that is left out
+#   punctuation   an end-of-sentence period, ? or !, or an apostrophe left out
+#
+# Safety rules (do not weaken these):
+#   * Text inside [[protected markers]] is NEVER touched, and neither is a
+#     word that has protected text in it.
+#   * Web addresses, emails, paths, code, anything with a digit, ALL-CAPS
+#     words, and abbreviations are skipped.
+#   * A mistake never lands where a pause marker or a smart-fix "noticed a
+#     slip" action sits inside it.
+#   * Once a mistake is typed, nothing in the typer deletes or retypes it.
+#     Sentence reworks skip the words around it (see rework_hold in
+#     type_text), and the regular typos only ever backspace their own
+#     characters.
+#   * Every mistake that is typed is recorded in state.left_mistakes with its
+#     line number and a before/after snippet for the report window.
+
+LEFT_MISTAKE_LABELS = {
+    "wrong_letter": "Wrong letter (a neighboring key)",
+    "swapped_letters": "Swapped letters",
+    "doubled_letter": "Doubled letter",
+    "missing_letter": "Missing letter",
+    "wrong_case": "Wrong capital letter (like tHe)",
+    "run_together": "Missing space (two words run together)",
+    "missing_comma": "Missing comma",
+    "missing_period": "Missing end punctuation",
+    "missing_apostrophe": "Missing apostrophe",
+}
+LEFT_MISTAKE_GROUPS = ("typos", "commas", "punctuation")
+LEFT_MISTAKE_DEFAULT_COUNT = 3
+LEFT_MISTAKE_MAX_COUNT = 200
+LEFT_MISTAKE_CONTEXT = 24      # characters of text shown on each side in the report
+LEFT_MISTAKE_MIN_GAP = 6       # closest two left mistakes may ever be (in characters)
+
+
+def get_left_mistake_options(settings):
+    """Returns which mistake groups are on, or None when leaving mistakes is
+    off (or every group is off)."""
+    if not settings.get("enable_leave_mistakes", False):
+        return None
+    options = {
+        "typos": bool(settings.get("leave_mistakes_typos", True)),
+        "commas": bool(settings.get("leave_mistakes_commas", True)),
+        "punctuation": bool(settings.get("leave_mistakes_punctuation", True)),
+    }
+    if not any(options.values()):
+        return None
+    return options
+
+
+def _left_word_bounds(text, index):
+    """Start and end (end is not included) of the run of letters that
+    contains text[index]."""
+    start = index
+    while start > 0 and text[start - 1].isalpha():
+        start -= 1
+    end = index + 1
+    while end < len(text) and text[end].isalpha():
+        end += 1
+    return start, end
+
+
+def _left_token_is_plain(text, index, protection_mask):
+    """True when the chunk of text around `index` (no whitespace inside) is
+    ordinary prose: not a web address, email, path, or code, has no digits,
+    and has no protected text in it."""
+    start = index
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    end = index + 1
+    while end < len(text) and not text[end].isspace():
+        end += 1
+    token = text[start:end]
+    if _smart_looks_technical(token):
+        return False
+    if any(char.isdigit() for char in token):
+        return False
+    return not any(protection_mask[start:end])
+
+
+def _left_letter_kinds(text, index, protection_mask):
+    """Which typo kinds could be left at the letter text[index]. Only the
+    inside of ordinary words with 3 or more letters qualifies, never the first
+    letter, so the result still looks like a believable slip."""
+    word_start, word_end = _left_word_bounds(text, index)
+    word_length = word_end - word_start
+    if word_length < 3 or index == word_start:
+        return []
+    if text[word_start:word_end].isupper():
+        return []
+    if not _left_token_is_plain(text, index, protection_mask):
+        return []
+
+    char = text[index]
+    previous_char = text[index - 1]
+    kinds = []
+    if char.lower() in QWERTY_ADJACENCY:
+        kinds.append("wrong_letter")
+    if "a" <= char <= "z":
+        # Update #44: one capital in the middle of a word, like the H in "tHe"
+        kinds.append("wrong_case")
+    if char != previous_char and (index + 1 >= len(text) or text[index + 1] != char):
+        kinds.append("doubled_letter")
+    if index + 1 < word_end:
+        next_char = text[index + 1]
+        if next_char != char:
+            kinds.append("swapped_letters")
+        if word_length >= 4 and char != previous_char and char != next_char:
+            kinds.append("missing_letter")
+    return kinds
+
+
+def _left_kind_span(kind, index):
+    """The (start, end) range of clean text that a mistake of this kind
+    replaces. Only swapped letters cover two characters."""
+    if kind == "swapped_letters":
+        return index, index + 2
+    return index, index + 1
+
+
+def _left_is_sentence_end(text, index, protection_mask):
+    """True for a . ! or ? that really ends a sentence: it follows a word of
+    2+ letters that is not an abbreviation, and is followed by the end of the
+    text, a line break, or a space and a capital letter."""
+    if index < 2 or not text[index - 1].isalpha() or not text[index - 2].isalpha():
+        return False
+    word_start, word_end = _left_word_bounds(text, index - 1)
+    if text[word_start:word_end].lower() in SMART_ABBREVIATIONS:
+        return False
+    if index + 1 < len(text) and text[index + 1] != "\n":
+        if not (text[index + 1] == " " and index + 2 < len(text) and text[index + 2].isupper()):
+            return False
+    return _left_token_is_plain(text, index - 1, protection_mask)
+
+
+def find_left_mistake_candidates(text, protection_mask, options, start_index,
+                                 blocked_positions, pause_positions, rng):
+    """Scans the text from start_index and returns the spots where a mistake
+    could be left, as {group: [(kind, position), ...]}. `blocked_positions`
+    are spots that must stay untouched; `pause_positions` are pause-marker
+    positions, which a two-character mistake must not straddle."""
+    pools = {group: [] for group in LEFT_MISTAKE_GROUPS}
+    length = len(text)
+
+    def span_is_free(start, end):
+        for position in range(start, end):
+            if protection_mask[position] or position in blocked_positions:
+                return False
+        for position in range(start + 1, end):
+            if position in pause_positions:
+                return False
+        return True
+
+    for index in range(start_index, length):
+        char = text[index]
+        if char.isalpha():
+            if options["typos"]:
+                kinds = _left_letter_kinds(text, index, protection_mask)
+                if kinds:
+                    kind = rng.choice(kinds)
+                    span_start, span_end = _left_kind_span(kind, index)
+                    if span_is_free(span_start, span_end):
+                        pools["typos"].append((kind, index))
+        elif char == " ":
+            if (options["typos"]
+                    and 0 < index < length - 1
+                    and text[index - 1].isalpha()
+                    and text[index + 1].isalpha()
+                    and _left_token_is_plain(text, index - 1, protection_mask)
+                    and _left_token_is_plain(text, index + 1, protection_mask)
+                    and span_is_free(index, index + 1)):
+                pools["typos"].append(("run_together", index))
+        elif char == ",":
+            if (options["commas"]
+                    and 0 < index < length - 1
+                    and text[index - 1].isalpha()
+                    and text[index + 1] == " "
+                    and _left_token_is_plain(text, index - 1, protection_mask)
+                    and span_is_free(index, index + 1)):
+                pools["commas"].append(("missing_comma", index))
+        elif char in ".!?":
+            if (options["punctuation"]
+                    and _left_is_sentence_end(text, index, protection_mask)
+                    and span_is_free(index, index + 1)):
+                pools["punctuation"].append(("missing_period", index))
+        elif char in "'\u2019":
+            if (options["punctuation"]
+                    and 0 < index < length - 1
+                    and text[index - 1].isalpha()
+                    and text[index + 1].isalpha()
+                    and _left_token_is_plain(text, index - 1, protection_mask)
+                    and span_is_free(index, index + 1)):
+                pools["punctuation"].append(("missing_apostrophe", index))
+    return pools
+
+
+def _choose_spread_candidates(pools, count, start_index, text_length, rng):
+    """Picks up to `count` candidates, spread out across the text and mixed
+    between the groups (so commas and punctuation are not drowned out by the
+    far more common typo spots). Starts with a wide minimum gap between
+    mistakes and loosens it only if there are not enough spots."""
+    span = max(text_length - start_index, 1)
+    wide_gap = max(40, span // (count * 2))
+    chosen = []
+    chosen_positions = set()
+
+    for min_gap in (wide_gap, wide_gap // 2, LEFT_MISTAKE_MIN_GAP):
+        remaining = {}
+        for group, items in pools.items():
+            fresh = [item for item in items if item[1] not in chosen_positions]
+            rng.shuffle(fresh)
+            remaining[group] = fresh
+        groups = [group for group, items in remaining.items() if items]
+
+        while len(chosen) < count and groups:
+            for group in list(groups):
+                if len(chosen) >= count:
+                    break
+                items = remaining[group]
+                picked = None
+                while items:
+                    candidate = items.pop()
+                    if all(abs(candidate[1] - other) >= min_gap for other in chosen_positions):
+                        picked = candidate
+                        break
+                if picked is not None:
+                    chosen.append(picked)
+                    chosen_positions.add(picked[1])
+                if not items:
+                    groups.remove(group)
+        if len(chosen) >= count:
+            break
+
+    chosen.sort(key=lambda item: item[1])
+    return chosen
+
+
+def _build_left_mistake(text, kind, start, rng):
+    """Returns (start, end, typed_text) for one chosen mistake: what gets
+    typed in place of text[start:end]."""
+    char = text[start]
+    if kind == "wrong_letter":
+        wrong = rng.choice(QWERTY_ADJACENCY[char.lower()])
+        return start, start + 1, (wrong.upper() if char.isupper() else wrong)
+    if kind == "wrong_case":
+        return start, start + 1, char.upper()
+    if kind == "doubled_letter":
+        return start, start + 1, char + char
+    if kind == "swapped_letters":
+        return start, start + 2, text[start + 1] + char
+    # missing_letter, run_together, missing_comma, missing_period,
+    # missing_apostrophe: the character is simply not typed.
+    return start, start + 1, ""
+
+
+def _left_mistake_snippets(text, start, end, typed):
+    """Returns (typed_snippet, correct_snippet) for the report. The whole
+    word (or the two words, for a missing space) is shown between \u00ab \u00bb,
+    with a little text on each side so it is easy to find with Ctrl+F."""
+    chunk_start = start
+    while chunk_start > 0 and not text[chunk_start - 1].isspace():
+        chunk_start -= 1
+    chunk_end = end
+    while chunk_end < len(text) and not text[chunk_end].isspace():
+        chunk_end += 1
+
+    def show(piece):
+        return piece.replace("\n", "\u21b5")
+
+    head = show(text[max(0, chunk_start - LEFT_MISTAKE_CONTEXT):chunk_start])
+    tail = show(text[chunk_end:chunk_end + LEFT_MISTAKE_CONTEXT])
+    typed_chunk = text[chunk_start:start] + typed + text[end:chunk_end]
+    correct_chunk = text[chunk_start:chunk_end]
+    typed_snippet = f"{head}\u00ab{show(typed_chunk)}\u00bb{tail}"
+    correct_snippet = f"{head}\u00ab{show(correct_chunk)}\u00bb{tail}"
+    return typed_snippet, correct_snippet
+
+
+def plan_left_mistakes(text, protection_mask, settings, start_index, pause_positions, blocked_positions):
+    """Chooses the mistakes to leave in this file. Returns {start position:
+    entry dict}. An entry has: kind, label, start, end, typed (what is typed
+    instead of text[start:end]), correct, line, typed_snippet, and
+    correct_snippet. Returns an empty dict when the mode is off. Fewer
+    mistakes than asked for are planned when the text has too few safe spots."""
+    options = get_left_mistake_options(settings)
+    if options is None or not text:
+        return {}
+    count = int(settings.get("leave_mistake_count", LEFT_MISTAKE_DEFAULT_COUNT))
+    count = max(1, min(count, LEFT_MISTAKE_MAX_COUNT))
+
+    rng = random.Random()
+    pools = find_left_mistake_candidates(
+        text, protection_mask, options, start_index, blocked_positions, pause_positions, rng
+    )
+    chosen = _choose_spread_candidates(pools, count, start_index, len(text), rng)
+
+    plan = {}
+    for kind, position in chosen:
+        start, end, typed = _build_left_mistake(text, kind, position, rng)
+        typed_snippet, correct_snippet = _left_mistake_snippets(text, start, end, typed)
+        plan[start] = {
+            "kind": kind,
+            "label": LEFT_MISTAKE_LABELS[kind],
+            "start": start,
+            "end": end,
+            "typed": typed,
+            "correct": text[start:end],
+            "line": text.count("\n", 0, start) + 1,
+            "typed_snippet": typed_snippet,
+            "correct_snippet": correct_snippet,
+        }
+    return plan
+
+
+# --------------------------------------------
+# PARAPHRASE-THEN-CORRECT (Idea #10)
+# --------------------------------------------
+# A hand-written synonym dictionary for natural paragraph-ending
+# rewording. Swaps common words with close alternatives so the app can
+# simulate drafting a sentence, pausing to reconsider, deleting it,
+# and retyping the true text.
+
+PARAPHRASE_SYNONYMS = {
+    # Common verbs
+    "make": ["create", "produce", "build"],
+    "makes": ["creates", "produces", "builds"],
+    "made": ["created", "produced", "built"],
+    "show": ["demonstrate", "display", "reveal"],
+    "shows": ["demonstrates", "displays", "reveals"],
+    "showed": ["demonstrated", "displayed", "revealed"],
+    "use": ["utilize", "employ", "apply"],
+    "uses": ["utilizes", "employs", "applies"],
+    "used": ["utilized", "employed", "applied"],
+    "start": ["begin", "commence", "initiate"],
+    "starts": ["begins", "commences", "initiates"],
+    "started": ["began", "commenced", "initiated"],
+    "stop": ["halt", "end", "cease"],
+    "stops": ["halts", "ends", "ceases"],
+    "stopped": ["halted", "ended", "ceased"],
+    "help": ["assist", "aid", "support"],
+    "helps": ["assists", "aids", "supports"],
+    "helped": ["assisted", "aided", "supported"],
+    "need": ["require", "demand"],
+    "needs": ["requires", "demands"],
+    "needed": ["required", "demanded"],
+    "think": ["believe", "consider", "feel"],
+    "thinks": ["believes", "considers", "feels"],
+    "thought": ["believed", "considered", "felt"],
+    "find": ["discover", "locate", "identify"],
+    "finds": ["discovers", "locates", "identifies"],
+    "found": ["discovered", "located", "identified"],
+    "give": ["provide", "offer", "grant"],
+    "gives": ["provides", "offers", "grants"],
+    "gave": ["provided", "offered", "granted"],
+    "get": ["obtain", "receive", "acquire"],
+    "gets": ["obtains", "receives", "acquires"],
+    "got": ["obtained", "received", "acquired"],
+    "tell": ["inform", "notify", "explain"],
+    "tells": ["informs", "notifies", "explains"],
+    "told": ["informed", "notified", "explained"],
+    "try": ["attempt", "strive"],
+    "tries": ["attempts", "strives"],
+    "tried": ["attempted", "strived"],
+    "check": ["verify", "inspect", "review"],
+    "checks": ["verifies", "inspects", "reviews"],
+    "checked": ["verified", "inspected", "reviewed"],
+    "keep": ["maintain", "retain", "preserve"],
+    "keeps": ["maintains", "retains", "preserves"],
+    "kept": ["maintained", "retained", "preserved"],
+    "change": ["alter", "modify", "adjust"],
+    "changes": ["alters", "modifies", "adjusts"],
+    "changed": ["altered", "modified", "adjusted"],
+    # Adjectives & adverbs
+    "quick": ["fast", "rapid", "swift"],
+    "quickly": ["fast", "rapidly", "swiftly"],
+    "slow": ["sluggish", "gradual", "unhurried"],
+    "slowly": ["gradually", "unhurriedly"],
+    "good": ["great", "fine", "solid"],
+    "great": ["excellent", "wonderful", "fantastic"],
+    "bad": ["poor", "flawed", "subpar"],
+    "big": ["large", "substantial", "sizable"],
+    "small": ["tiny", "minor", "slight"],
+    "simple": ["straightforward", "basic", "easy"],
+    "simply": ["just", "merely"],
+    "hard": ["difficult", "tough", "challenging"],
+    "easy": ["simple", "effortless", "straightforward"],
+    "easily": ["smoothly", "readily"],
+    "important": ["crucial", "vital", "essential"],
+    "main": ["primary", "key", "central"],
+    "clear": ["obvious", "evident", "apparent"],
+    "clearly": ["plainly", "obviously", "evidently"],
+    "correct": ["accurate", "right", "proper"],
+    "wrong": ["incorrect", "inaccurate", "erroneous"],
+    "certain": ["sure", "confident"],
+    "certainly": ["surely", "definitely"],
+    "maybe": ["perhaps", "possibly"],
+    "often": ["frequently", "regularly"],
+    "rarely": ["seldom", "hardly"],
+    "always": ["consistently", "invariably"],
+    "final": ["last", "ultimate", "concluding"],
+    "finally": ["eventually", "at last", "ultimately"],
+    # Transitions & nouns
+    "however": ["nevertheless", "nonetheless", "yet"],
+    "also": ["furthermore", "moreover"],
+    "therefore": ["thus", "hence", "consequently"],
+    "problem": ["issue", "trouble", "difficulty"],
+    "problems": ["issues", "troubles", "difficulties"],
+    "way": ["method", "manner", "approach"],
+    "ways": ["methods", "approaches"],
+    "idea": ["concept", "thought", "notion"],
+    "ideas": ["concepts", "thoughts", "notions"],
+    "task": ["job", "duty", "assignment"],
+    "tasks": ["jobs", "duties", "assignments"],
+    "result": ["outcome", "consequence"],
+    "results": ["outcomes", "consequences"],
+    "reason": ["cause", "rationale"],
+    "reasons": ["causes", "rationales"],
+    "part": ["portion", "section", "segment"],
+    "parts": ["portions", "sections", "segments"],
+}
+
+
+def _match_case(original, replacement):
+    """Preserves all-caps or title-case when substituting a word."""
+    if original.isupper():
+        return replacement.upper()
+    if original and original[0].isupper():
+        return replacement.capitalize()
+    return replacement.lower()
+
+
+def generate_paraphrase(sentence):
+    """Substitutes available synonyms in `sentence` while keeping punctuation
+    and casing intact. If too few words (fewer than 1 for short sentences,
+    or fewer than 2 for sentences with 6+ words) have a synonym available,
+    returns None to avoid typing broken fragments."""
+    matches = list(re.finditer(r"\b[A-Za-z]+('?[A-Za-z]+)?\b", sentence))
+    if not matches:
+        return None
+
+    candidates = []
+    for m in matches:
+        word = m.group(0)
+        lower_word = word.lower()
+        if lower_word in PARAPHRASE_SYNONYMS:
+            candidates.append((m.start(), m.end(), word, PARAPHRASE_SYNONYMS[lower_word]))
+
+    total_words = len(matches)
+    if not candidates:
+        return None
+    if total_words >= 6 and len(candidates) < 2:
+        return None
+
+    swap_count = min(len(candidates), random.randint(1, min(3, len(candidates))))
+    chosen_candidates = random.sample(candidates, swap_count)
+    chosen_candidates.sort(key=lambda c: c[0])
+
+    parts = []
+    last_idx = 0
+    for start, end, orig_word, syn_list in chosen_candidates:
+        parts.append(sentence[last_idx:start])
+        chosen_syn = random.choice(syn_list)
+        parts.append(_match_case(orig_word, chosen_syn))
+        last_idx = end
+    parts.append(sentence[last_idx:])
+
+    reworded = "".join(parts)
+    if reworded == sentence:
+        return None
+    return reworded
+
+
+def precompute_paragraph_paraphrases(text, protected_ranges):
+    """Scans text for paragraphs (blocks ending in '\\n') and finds the last
+    punctuated sentence in each paragraph. Pre-generates paraphrases for
+    valid candidates that do not overlap protected ranges.
+
+    Returns a dict mapping start_char_index -> (end_char_index, paraphrased_text, original_text).
+    """
+    paraphrase_map = {}
+    if not text:
+        return paraphrase_map
+
+    # Paragraphs end at '\n'
+    para_starts = [0]
+    for m in re.finditer(r"\n", text):
+        para_starts.append(m.end())
+
+    for i in range(len(para_starts) - 1):
+        p_start = para_starts[i]
+        p_end = para_starts[i + 1] - 1  # exclude '\n'
+        para_text = text[p_start:p_end]
+        if not para_text.strip():
+            continue
+
+        term_matches = list(re.finditer(r'[.!?]+["\')\]]*', para_text))
+        if not term_matches:
+            continue
+
+        last_term = term_matches[-1]
+        sent_end_rel = last_term.end()
+
+        if len(term_matches) > 1:
+            prev_term = term_matches[-2]
+            search_start = prev_term.end()
+            while search_start < sent_end_rel and para_text[search_start].isspace():
+                search_start += 1
+            sent_start_rel = search_start
+        else:
+            search_start = 0
+            while search_start < sent_end_rel and para_text[search_start].isspace():
+                search_start += 1
+            sent_start_rel = search_start
+
+        if sent_start_rel >= sent_end_rel:
+            continue
+
+        abs_start = p_start + sent_start_rel
+        abs_end = p_start + sent_end_rel
+        sentence_str = text[abs_start:abs_end]
+
+        overlaps_protected = any(
+            max(abs_start, prot_start) < min(abs_end, prot_end)
+            for prot_start, prot_end in protected_ranges
+        )
+        if overlaps_protected:
+            continue
+
+        paraphrased = generate_paraphrase(sentence_str)
+        if paraphrased and paraphrased != sentence_str:
+            paraphrase_map[abs_start] = (abs_end, paraphrased, sentence_str)
+
+    return paraphrase_map
+
+
+# --------------------------------------------
+# SECOND REVISION PASS (Update #34)
+# --------------------------------------------
+# Real writers often reread a paragraph and go back to change a word in an
+# earlier sentence. With this feature, one word in a paragraph is first typed
+# as a close synonym. When the paragraph is finished, the typist presses the
+# Left arrow key to go back to that word, deletes it, types the real word, and
+# presses the Right arrow key the same number of times to come back to the end.
+# The final text is always exactly the file's text.
+#
+# Safety rules (the planner skips a paragraph instead of guessing):
+#   * only words that have a built-in synonym, only plain letters, and never
+#     the first word of a paragraph;
+#   * the word must be LOOKBACK_MIN_CHARS to LOOKBACK_MAX_CHARS back, so the
+#     arrow keys stay short and the count stays exact;
+#   * the text between the word and the end of the paragraph may only use the
+#     characters in LOOKBACK_SAFE_CHARS and nothing in LOOKBACK_RISKY_TEXT,
+#     because an editor could shorten or change those and break the count;
+#   * no protected text, formatting shortcut, or purposely left mistake may sit
+#     between the word and the end of the paragraph.
+LOOKBACK_MIN_CHARS = 30
+LOOKBACK_MAX_CHARS = 250
+LOOKBACK_CHANCE_MAX = 100.0
+LOOKBACK_KEY_CHUNK = 8  # arrow presses sent at once, so Stop and Pause still work
+LOOKBACK_ESTIMATE_SECONDS = 9.0  # rough time for one trip back and forth
+LOOKBACK_SAFE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?'\"()-$%"
+)
+LOOKBACK_RISKY_TEXT = ("..", "--", "(c)", "(r)", "(tm)", ":)", ":(", ":-")
+# A word is a run of letters that starts after a space and is not joined to a
+# digit, apostrophe, or hyphen on its right.
+LOOKBACK_WORD_PATTERN = re.compile(r"(?<= )[A-Za-z]+(?![A-Za-z0-9'\-])")
+
+
+def _lookback_span_is_safe(text, protection_mask, start, end):
+    """True when text[start:end] is safe to move the cursor across with the
+    arrow keys: only plain characters, nothing an editor might change, and no
+    protected text."""
+    span = text[start:end]
+    if any(char not in LOOKBACK_SAFE_CHARS for char in span):
+        return False
+    lowered = span.lower()
+    if any(risky in lowered for risky in LOOKBACK_RISKY_TEXT):
+        return False
+    return not any(protection_mask[start:end])
+
+
+def _choose_lookback_edit(text, protection_mask, para_start, trigger_idx, resume_from,
+                          format_map, left_mistake_map, fix_actions, pause_map, cluster_flags=None):
+    """Picks one word to swap in the paragraph text[para_start:trigger_idx].
+    Returns an edit dict (start, end, trigger, original, draft, distance,
+    swapped) or None when the paragraph has no safe word."""
+    para_text = text[para_start:trigger_idx]
+    if not para_text.strip():
+        return None
+
+    # Never in a paragraph that holds a bold or italic shortcut, or that starts
+    # with a style already switched on.
+    if any(para_start <= position <= trigger_idx for position in format_map):
+        return None
+    active_styles = set()
+    for position in sorted(format_map):
+        if position >= para_start:
+            break
+        active_styles ^= set(format_map[position])
+    if active_styles:
+        return None
+
+    candidates = []
+    for match in LOOKBACK_WORD_PATTERN.finditer(para_text):
+        word = match.group(0)
+        synonyms = PARAPHRASE_SYNONYMS.get(word.lower())
+        if not synonyms:
+            continue
+        word_start = para_start + match.start()
+        word_end = para_start + match.end()
+        distance = trigger_idx - word_end
+        if word_start < resume_from:
+            continue
+        if distance < LOOKBACK_MIN_CHARS or distance > LOOKBACK_MAX_CHARS:
+            continue
+        if any(protection_mask[word_start:word_end]):
+            continue
+        if not _lookback_span_is_safe(text, protection_mask, word_end, trigger_idx):
+            continue
+        # A purposely left mistake changes how many characters are on screen.
+        if any(word_start <= position < trigger_idx for position in left_mistake_map):
+            continue
+        # Pause markers and slips inside the word would be skipped, so avoid it.
+        if any(word_start < position < word_end for position in pause_map):
+            continue
+        if any(word_start < position < word_end for position in fix_actions):
+            continue
+        candidates.append((word_start, word_end, word, synonyms))
+
+    if not candidates:
+        return None
+    # Update #39: when the paragraph has a revision cluster, pick a word in it.
+    word_start, word_end, word, synonyms = random.choice(prefer_cluster_candidates(candidates, cluster_flags))
+    draft = _match_case(word, random.choice(synonyms))
+    if draft == word or not draft.isalpha():
+        return None
+    return {
+        "start": word_start,
+        "end": word_end,
+        "trigger": trigger_idx,
+        "original": word,
+        "draft": draft,
+        "distance": trigger_idx - word_end,
+        "swapped": False,  # set to True once the draft word was really typed
+    }
+
+
+def plan_lookback_edits(text, protection_mask, settings, resume_from,
+                        format_map, left_mistake_map, fix_actions, pause_map, cluster_flags=None):
+    """Plans the second revision pass before typing starts. Returns two dicts
+    that share the same edit dicts: swaps ({word start: edit}, where the draft
+    word is typed) and fixes ({paragraph end: edit}, where the typist goes back
+    and corrects it). Each paragraph gets an edit with the chosen chance. The
+    last paragraph counts too, even without a line break after it."""
+    swaps = {}
+    fixes = {}
+    if not settings.get("enable_lookback_edit", False) or not text:
+        return swaps, fixes
+    chance = float(settings.get("lookback_edit_chance", 0.0))
+    if chance <= 0:
+        return swaps, fixes
+
+    para_start = 0
+    while para_start < len(text):
+        trigger_idx = text.find("\n", para_start)
+        if trigger_idx == -1:
+            trigger_idx = len(text)
+        if trigger_idx > para_start and trigger_idx > resume_from and random.uniform(0, 100) < chance:
+            edit = _choose_lookback_edit(
+                text, protection_mask, para_start, trigger_idx, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map, cluster_flags,
+            )
+            if edit is not None:
+                swaps[edit["start"]] = edit
+                fixes[edit["trigger"]] = edit
+        para_start = trigger_idx + 1
+    return swaps, fixes
+
+
+# --------------------------------------------
+# SELECT AND RETYPE, PLUS OVERSHOOT (Update #35)
+# --------------------------------------------
+# Two more ways a real typist fixes things:
+#
+# 1. Select and retype. Right after finishing a word, the typist decides it is
+#    the wrong word, holds Shift and taps Left once for each letter to select
+#    it, and types the real word over the highlighted one. The draft word is a
+#    close synonym (the same built-in list the paragraph paraphrase uses), so
+#    the final text is always exactly the file's text. The press count is the
+#    exact number of letters just typed, and the cursor is still right after
+#    them, so the selection can never reach anything else.
+#
+# 2. Overshoot. After a typo has been backspaced away, the typist sometimes
+#    presses Backspace one time too many, notices, and types that letter again.
+#    It only needs the Backspace key, so it works in any text box.
+#
+# Safety rules (the planner skips a word instead of guessing):
+#   * only words with a built-in synonym, only plain letters, and never the
+#     first word of a paragraph (the same word pattern as the second revision);
+#   * no protected text, bold or italic marker, purposely left mistake, pause
+#     marker, or smart-fix slip may touch the word;
+#   * never a word that the second revision pass already uses.
+# Overshoot never reaches past the one letter right before the cursor, is skipped
+# next to bold or italic shortcuts, and always puts the letter back, even if Stop
+# is pressed in the middle.
+SELECT_RETYPE_CHANCE_MAX = 100.0
+OVERSHOOT_CHANCE_MAX = 100.0
+SELECT_RETYPE_ESTIMATE_SECONDS = 5.0  # rough time for one select and retype
+OVERSHOOT_ESTIMATE_SECONDS = 1.2  # rough extra time for one overshoot
+
+
+def _choose_select_retype(text, protection_mask, para_start, para_end, resume_from,
+                          format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps,
+                          cluster_flags=None):
+    """Picks one word to select and retype in the paragraph text[para_start:para_end].
+    Returns an edit dict (start, end, original, draft) or None when the paragraph
+    has no safe word."""
+    para_text = text[para_start:para_end]
+    if not para_text.strip():
+        return None
+
+    format_positions = sorted(format_map)
+    candidates = []
+    for match in LOOKBACK_WORD_PATTERN.finditer(para_text):
+        word = match.group(0)
+        synonyms = PARAPHRASE_SYNONYMS.get(word.lower())
+        if not synonyms:
+            continue
+        word_start = para_start + match.start()
+        word_end = para_start + match.end()
+        if word_start < resume_from:
+            continue
+        if any(protection_mask[word_start:word_end]):
+            continue
+        # No bold or italic shortcut at or inside the word, and no style switched
+        # on when the word starts (a retyped word could lose the style).
+        if any(word_start - 1 <= position <= word_end + 1 for position in format_positions):
+            continue
+        active_styles = set()
+        for position in format_positions:
+            if position >= word_start:
+                break
+            active_styles ^= set(format_map[position])
+        if active_styles:
+            continue
+        # A purposely left mistake changes what is on screen.
+        if any(position < word_end and entry["end"] > word_start
+               for position, entry in left_mistake_map.items()):
+            continue
+        # Pause markers and slips inside the word would be skipped, so avoid it.
+        if any(word_start < position < word_end for position in pause_map):
+            continue
+        if any(word_start < position < word_end for position in fix_actions):
+            continue
+        # Never the same word the second revision pass changes.
+        if any(edit["start"] < word_end and word_start < edit["end"] for edit in lookback_swaps.values()):
+            continue
+        candidates.append((word_start, word_end, word, synonyms))
+
+    if not candidates:
+        return None
+    # Update #39: when the paragraph has a revision cluster, pick a word in it.
+    word_start, word_end, word, synonyms = random.choice(prefer_cluster_candidates(candidates, cluster_flags))
+    draft = _match_case(word, random.choice(synonyms))
+    if draft == word or not draft.isalpha():
+        return None
+    return {
+        "start": word_start,
+        "end": word_end,
+        "original": word,
+        "draft": draft,
+    }
+
+
+def plan_select_retypes(text, protection_mask, settings, resume_from,
+                        format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps,
+                        cluster_flags=None):
+    """Plans select and retype before typing starts. Returns a dict
+    {word start: edit}. Each paragraph gets one edit with the chosen chance. The
+    last paragraph counts too, even without a line break after it."""
+    plan = {}
+    if not settings.get("enable_select_retype", False) or not text:
+        return plan
+    chance = float(settings.get("select_retype_chance", 0.0))
+    if chance <= 0:
+        return plan
+
+    para_start = 0
+    while para_start < len(text):
+        para_end = text.find("\n", para_start)
+        if para_end == -1:
+            para_end = len(text)
+        if para_end > para_start and para_end > resume_from and random.uniform(0, 100) < chance:
+            edit = _choose_select_retype(
+                text, protection_mask, para_start, para_end, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps,
+                cluster_flags,
+            )
+            if edit is not None:
+                plan[edit["start"]] = edit
+        para_start = para_end + 1
+    return plan
+
+
+# --------------------------------------------
+# REVISION CLUSTERS (Update #39)
+# --------------------------------------------
+# Real revising bunches together. A writer changes one phrase, then fixes a
+# few more things in a row, then drafts calmly for a while. Without this,
+# every mistake lands at a random spot, evenly spread through the file.
+#
+# Clusters are short stretches of the text (about 70 to 220 characters, always
+# starting at the beginning of a sentence). Inside a cluster the typo chance,
+# the sentence rework count, and the paragraph paraphrase chance are raised by
+# the cluster weight. Outside a cluster they are lowered by the calm weight.
+# get_cluster_weights() works the two weights out so that the average over the
+# whole file stays at 1.0. That is why the total number of mistakes, and so the
+# time estimate, stay the same. The second revision pass and select and retype
+# also pick their word inside a cluster when the paragraph has one.
+#
+# Three revision styles decide where the clusters go in a paragraph:
+#   * "Edit as I go": clusters are spread through the paragraph with calm
+#     stretches between them.
+#   * "Draft, then revise": the start of the paragraph is calm and one cluster
+#     sits at the end (the writer rereads the paragraph and revises it).
+#   * "Mixed": each paragraph randomly uses one of the two styles.
+#
+# Only paragraphs of CLUSTER_MIN_PARAGRAPH_CHARS or more get clusters. Nothing
+# here changes the typed text. Protected text is still never touched, because
+# every mistake feature checks for protected text itself.
+CLUSTER_STRENGTH_MAX = 200.0
+CLUSTER_BASE_BOOST = 1.5  # at 100% strength, a cluster weight of 1 + 1.5 = 2.5
+CLUSTER_STYLE_MIXED = "Mixed"
+CLUSTER_STYLE_AS_YOU_GO = "Edit as I go"
+CLUSTER_STYLE_DRAFT_FIRST = "Draft, then revise"
+CLUSTER_STYLES = (CLUSTER_STYLE_MIXED, CLUSTER_STYLE_AS_YOU_GO, CLUSTER_STYLE_DRAFT_FIRST)
+CLUSTER_MIN_PARAGRAPH_CHARS = 160
+CLUSTER_MIN_CHARS = 70
+CLUSTER_MAX_CHARS = 220
+CLUSTER_GAP_MIN = 250  # calm characters between two clusters (edit as I go)
+CLUSTER_GAP_MAX = 650
+CLUSTER_DRAFT_FRACTION = 0.65  # draft then revise: the cluster starts after this much of the paragraph
+CLUSTER_DRAFT_MAX_CHARS = 300  # ... and is never longer than this (unless the last sentence is)
+CLUSTER_MIN_CALM_WEIGHT = 0.2  # calm stretches keep at least this share of the normal mistake rate
+CLUSTER_DRAFT_CHANCE = 85.0  # percent of paragraphs that get an end-of-paragraph cluster
+CLUSTER_SENTENCE_START = re.compile(r"[.!?][\"')\]]*\s+(?=\S)")
+
+
+def clamp_cluster_strength(strength_percent):
+    """Returns the cluster strength as a float between 0 and CLUSTER_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), CLUSTER_STRENGTH_MAX))
+    except (TypeError, ValueError):
+        return 100.0
+
+
+def normalize_cluster_style(value):
+    """Returns a known revision style, or Mixed for anything else (settings
+    and profile files are untrusted input)."""
+    return value if value in CLUSTER_STYLES else CLUSTER_STYLE_MIXED
+
+
+def _cluster_sentence_starts(text, para_start, para_end):
+    """Returns the index where each sentence of text[para_start:para_end] starts."""
+    starts = [para_start]
+    for match in CLUSTER_SENTENCE_START.finditer(text, para_start, para_end):
+        starts.append(match.end())
+    return [start for start in starts if start < para_end]
+
+
+def _cluster_snap_end(text, start, target_end, para_end):
+    """Moves a cluster end to the nearest sentence or phrase end before
+    target_end (so a cluster does not stop in the middle of a phrase). When
+    there is none, it moves forward to the next space instead."""
+    end = min(target_end, para_end)
+    if end >= para_end:
+        return para_end
+    floor = start + CLUSTER_MIN_CHARS // 2
+    for position in range(end, floor, -1):
+        if text[position - 1] in ".!?,;:":
+            return position
+    while end < para_end and text[end] != " ":
+        end += 1
+    return end
+
+
+def _plan_clusters_as_you_go(text, para_start, para_end, rng):
+    """Edit as I go: clusters spread through one paragraph, each starting at a
+    sentence start, with calm stretches in between."""
+    zones = []
+    cursor = para_start + rng.randint(0, CLUSTER_GAP_MIN)
+    for start in _cluster_sentence_starts(text, para_start, para_end):
+        if start < cursor:
+            continue
+        if para_end - start < CLUSTER_MIN_CHARS // 2:
+            break
+        target_end = start + rng.randint(CLUSTER_MIN_CHARS, CLUSTER_MAX_CHARS)
+        end = _cluster_snap_end(text, start, target_end, para_end)
+        if end - start < CLUSTER_MIN_CHARS // 2:
+            continue
+        zones.append((start, end))
+        cursor = end + rng.randint(CLUSTER_GAP_MIN, CLUSTER_GAP_MAX)
+    return zones
+
+
+def _plan_clusters_draft_then_revise(text, para_start, para_end, rng):
+    """Draft, then revise: the start of the paragraph is calm, and one cluster
+    covers its last sentence or two, where the writer rereads and revises."""
+    if rng.uniform(0, 100) >= CLUSTER_DRAFT_CHANCE:
+        return []
+    starts = _cluster_sentence_starts(text, para_start, para_end)
+    threshold = max(
+        para_start + int((para_end - para_start) * CLUSTER_DRAFT_FRACTION),
+        para_end - CLUSTER_DRAFT_MAX_CHARS,
+    )
+    later = [start for start in starts if start >= threshold]
+    if later:
+        start = later[0]
+    elif len(starts) > 1:
+        start = starts[-1]
+    else:
+        return []
+    if para_end - start < CLUSTER_MIN_CHARS // 2:
+        return []
+    return [(start, para_end)]
+
+
+def plan_revision_clusters(text, start_index=0, style=CLUSTER_STYLE_MIXED, rng=None):
+    """Plans the revision clusters before typing starts, only for text that is
+    still to be typed (from start_index on). Returns a sorted list of
+    (start, end) character ranges. Paragraphs that are too short get none."""
+    rng = rng or random
+    style = normalize_cluster_style(style)
+    zones = []
+    para_start = 0
+    while para_start < len(text):
+        para_end = text.find("\n", para_start)
+        if para_end == -1:
+            para_end = len(text)
+        if para_end > start_index and para_end - para_start >= CLUSTER_MIN_PARAGRAPH_CHARS:
+            para_style = style
+            if para_style == CLUSTER_STYLE_MIXED:
+                para_style = rng.choice((CLUSTER_STYLE_AS_YOU_GO, CLUSTER_STYLE_DRAFT_FIRST))
+            if para_style == CLUSTER_STYLE_AS_YOU_GO:
+                found = _plan_clusters_as_you_go(text, para_start, para_end, rng)
+            else:
+                found = _plan_clusters_draft_then_revise(text, para_start, para_end, rng)
+            for zone_start, zone_end in found:
+                zone_start = max(zone_start, start_index)
+                if zone_end - zone_start >= CLUSTER_MIN_CHARS // 2:
+                    zones.append((zone_start, zone_end))
+        para_start = para_end + 1
+    return zones
+
+
+def build_cluster_flags(text_length, zones):
+    """Returns a bytearray with one entry per character: 1 inside a cluster,
+    0 outside. The typing loop reads it once per character."""
+    flags = bytearray(text_length)
+    for zone_start, zone_end in zones:
+        zone_end = min(zone_end, text_length)
+        if zone_start < zone_end:
+            flags[zone_start:zone_end] = b"\x01" * (zone_end - zone_start)
+    return flags
+
+
+def get_cluster_weights(cluster_fraction, strength_percent):
+    """Returns (cluster_weight, calm_weight). cluster_fraction is the share of
+    the text still to be typed that lies inside clusters (0 to 1). The weights
+    are worked out so cluster_fraction * cluster_weight + (1 - cluster_fraction)
+    * calm_weight is 1.0, so the average number of mistakes does not change."""
+    strength = clamp_cluster_strength(strength_percent) / 100.0
+    if strength <= 0 or cluster_fraction <= 0 or cluster_fraction >= 1:
+        return 1.0, 1.0
+    cluster_weight = 1.0 + CLUSTER_BASE_BOOST * strength
+    # Calm stretches always keep a small share of the normal rate (a real typist
+    # still slips now and then), so the cluster weight has a ceiling. Solving
+    # fraction * cluster + (1 - fraction) * calm = 1 for the cluster weight gives it.
+    ceiling = (1.0 - (1.0 - cluster_fraction) * CLUSTER_MIN_CALM_WEIGHT) / cluster_fraction
+    cluster_weight = min(cluster_weight, ceiling)
+    calm_weight = (1.0 - cluster_fraction * cluster_weight) / (1.0 - cluster_fraction)
+    return cluster_weight, max(calm_weight, 0.0)
+
+
+def prefer_cluster_candidates(candidates, cluster_flags):
+    """candidates is a list of tuples whose first item is a word's start index.
+    Returns the ones inside a revision cluster when there are any, otherwise
+    all of them."""
+    if not cluster_flags:
+        return candidates
+    inside = [item for item in candidates if item[0] < len(cluster_flags) and cluster_flags[item[0]]]
+    return inside or candidates
+
+
+# --------------------------------------------
+# CHECK TYPED TEXT (Update #51)
+# --------------------------------------------
+# After a run finishes, the text that really ended up on screen is compared with
+# the text Amanuensis meant to type. A preview run is always checked (the Preview
+# Run box is read directly). A real run is checked only when the person turns on
+# "Check typed text" (the Hotkeys tab): Amanuensis selects everything before the
+# cursor in the target window, copies it, and compares the copy. The comparison
+# itself (below) is plain text work with no windows or keys, so it is easy to test.
+CHECK_CONTEXT_CHARS = 20            # characters of text shown on each side of a difference
+CHECK_MAX_DIFFERENCES_SHOWN = 25    # most differences listed in the report
+CHECK_MAX_PIECE_CHARS = 60          # longest piece of text shown for one difference
+CHECK_MAX_CHAR_DIFF_CELLS = 4000000  # bigger blocks are reported as one difference
+CHECK_MERGE_GAP_CHARS = 2           # changes this close together count as one difference
+CHECK_SETTLE_SECONDS = 1.0          # let the editor catch up before reading it back
+CHECK_COPY_WAIT_SECONDS = 4.0       # how long to wait for the copy to land on the clipboard
+CHECK_MAIN_THREAD_WAIT_SECONDS = 10.0
+
+# Editors often swap straight quotes for curly ones, or use non-breaking spaces.
+# Those are not typing mistakes, so they are treated as the same text.
+_CHECK_CHARACTER_MAP = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"',
+    "\u00a0": " ", "\u2007": " ", "\u202f": " ",
+    "\u000b": "\n", "\u2028": "\n", "\u2029": "\n",
+    "\u200b": None, "\u200c": None, "\u200d": None, "\u2060": None, "\ufeff": None,
+})
+
+
+def normalize_for_check(text):
+    """Makes line endings, curly quotes, non-breaking spaces, and invisible
+    characters the same on both sides, and drops spaces and line breaks at the
+    very end, so only real differences are left."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.translate(_CHECK_CHARACTER_MAP).rstrip()
+
+
+def build_expected_typed_text(text, resume_from, left_mistake_map):
+    """The text that should be on screen after a run: text[resume_from:], with
+    each purposely left mistake (Update #24) in place of the correct text. Every
+    other edit (typos, reworks, second revision words, smart fixes) ends with
+    the correct text, so nothing else changes it."""
+    pieces = []
+    position = resume_from
+    for start in sorted(left_mistake_map):
+        entry = left_mistake_map[start]
+        if start < position:
+            continue
+        pieces.append(text[position:start])
+        pieces.append(entry["typed"])
+        position = max(entry["end"], start + 1)
+    pieces.append(text[position:])
+    return "".join(pieces)
+
+
+def _check_show(piece):
+    piece = piece.replace("\n", "\u21b5")
+    if len(piece) > CHECK_MAX_PIECE_CHARS:
+        half = CHECK_MAX_PIECE_CHARS // 2
+        piece = piece[:half] + "\u2026" + piece[-half:]
+    return piece
+
+
+def _check_snippets(expected, exp_start, exp_end, found_piece):
+    """Returns (on_screen, should_be) text for one difference: the whole word
+    around it, with a little text on each side. The part to look at is shown
+    between \u00ab \u00bb."""
+    chunk_start = exp_start
+    while chunk_start > 0 and not expected[chunk_start - 1].isspace():
+        chunk_start -= 1
+    chunk_end = exp_end
+    while chunk_end < len(expected) and not expected[chunk_end].isspace():
+        chunk_end += 1
+    head = expected[max(0, chunk_start - CHECK_CONTEXT_CHARS):chunk_start].split("\n")[-1]
+    tail = expected[chunk_end:chunk_end + CHECK_CONTEXT_CHARS].split("\n")[0]
+    head = _check_show(head)
+    tail = _check_show(tail)
+    found_chunk = expected[chunk_start:exp_start] + found_piece + expected[exp_end:chunk_end]
+    expected_chunk = expected[chunk_start:chunk_end]
+    return (
+        f"{head}\u00ab{_check_show(found_chunk)}\u00bb{tail}",
+        f"{head}\u00ab{_check_show(expected_chunk)}\u00bb{tail}",
+    )
+
+
+def _split_earlier_text(found_lines, expected_lines):
+    """When the document already had text before the cursor on the same line as
+    the first typed line, that line ends with the first expected line. Splits it
+    so the earlier part is its own line and can be ignored."""
+    first = expected_lines[0]
+    if not first:
+        return found_lines
+    candidates = [i for i, line in enumerate(found_lines) if line.endswith(first)]
+    if not candidates:
+        return found_lines
+    wanted_after = len(expected_lines) - 1
+    best = min(candidates, key=lambda i: (abs((len(found_lines) - 1 - i) - wanted_after), -i))
+    line = found_lines[best]
+    if len(line) == len(first):
+        return found_lines
+    return found_lines[:best] + [line[:len(line) - len(first)], first] + found_lines[best + 1:]
+
+
+def compare_typed_text(expected, found):
+    """Compares the text that should be on screen with what was read back.
+    Anything in `found` before the typed text (earlier text already in the
+    document) is ignored. Returns a dict:
+      matched: True when they are the same
+      difference_count: how many differences there are
+      differences: the first CHECK_MAX_DIFFERENCES_SHOWN, each with line,
+        kind (wrong, missing, or extra), on_screen, and should_be
+      expected_length: characters that should have been typed"""
+    expected = normalize_for_check(expected)
+    found = normalize_for_check(found)
+    result = {"matched": True, "difference_count": 0, "differences": [], "expected_length": len(expected)}
+    if found.endswith(expected):
+        return result
+
+    expected_lines = expected.split("\n")
+    found_lines = _split_earlier_text(found.split("\n"), expected_lines)
+    expected_offsets = []
+    running = 0
+    for line in expected_lines:
+        expected_offsets.append(running)
+        running += len(line) + 1
+
+    line_matcher = difflib.SequenceMatcher(None, found_lines, expected_lines, autojunk=False)
+    differences = []
+    for op_index, (tag, i1, i2, j1, j2) in enumerate(line_matcher.get_opcodes()):
+        if tag == "equal":
+            continue
+        if op_index == 0 and tag == "delete":
+            continue  # earlier text that was already in the document
+        found_block = "\n".join(found_lines[i1:i2])
+        expected_block = "\n".join(expected_lines[j1:j2])
+        block_start = expected_offsets[j1] if j1 < len(expected_offsets) else len(expected)
+        if len(found_block) * len(expected_block) > CHECK_MAX_CHAR_DIFF_CELLS:
+            char_ops = [("replace", 0, len(found_block), 0, len(expected_block))]
+        else:
+            char_ops = difflib.SequenceMatcher(None, found_block, expected_block, autojunk=False).get_opcodes()
+        changes = []
+        for char_index, (char_tag, a1, a2, b1, b2) in enumerate(char_ops):
+            if char_tag == "equal":
+                continue
+            if op_index == 0 and char_index == 0 and char_tag == "delete":
+                continue  # earlier text on the first line
+            if changes and a1 - changes[-1][1] <= CHECK_MERGE_GAP_CHARS and b1 - changes[-1][3] <= CHECK_MERGE_GAP_CHARS:
+                # Changes only a letter or two apart are one mistake (like swapped letters).
+                changes[-1] = (changes[-1][0], a2, changes[-1][2], b2)
+            else:
+                changes.append((a1, a2, b1, b2))
+        for a1, a2, b1, b2 in changes:
+            exp_start = block_start + b1
+            exp_end = block_start + b2
+            found_piece = found_block[a1:a2]
+            kind = "wrong"
+            if a1 == a2:
+                kind = "missing"
+            elif b1 == b2:
+                kind = "extra"
+            on_screen, should_be = _check_snippets(expected, exp_start, exp_end, found_piece)
+            differences.append({
+                "line": expected.count("\n", 0, min(exp_start, len(expected))) + 1,
+                "kind": kind,
+                "on_screen": on_screen,
+                "should_be": should_be,
+            })
+    result["matched"] = not differences
+    result["difference_count"] = len(differences)
+    result["differences"] = differences[:CHECK_MAX_DIFFERENCES_SHOWN]
+    return result
+
+
+def _call_on_main_thread_and_wait(func):
+    """Runs func on the main thread (from the typing thread) and waits for its
+    answer. Returns (True, value), or (False, None) when it failed or took too
+    long. The call goes through the same queue as the preview writes, so it runs
+    after all of them."""
+    done = threading.Event()
+    box = {}
+
+    def runner():
+        try:
+            box["value"] = func()
+        except (tk.TclError, ValueError, RuntimeError):
+            box["failed"] = True
+        finally:
+            done.set()
+
+    run_on_main_thread(runner)
+    if not done.wait(CHECK_MAIN_THREAD_WAIT_SECONDS) or box.get("failed"):
+        return False, None
+    return True, box.get("value")
+
+
+def _read_preview_text():
+    """Main thread: everything in the Preview Run box, or None when it is gone."""
+    if preview_text_widget is None:
+        return None
+    return preview_text_widget.get("1.0", "end-1c")
+
+
+def _read_clipboard_text():
+    """Main thread: the text on the clipboard, or None when it is empty or not text."""
+    try:
+        return window.clipboard_get()
+    except tk.TclError:
+        return None
+
+
+def _write_clipboard_text(text):
+    """Main thread: puts `text` on the clipboard (None or empty clears it)."""
+    window.clipboard_clear()
+    if text:
+        window.clipboard_append(text)
+
+
+def _read_back_window_text(settings, expected):
+    """Copies everything before the cursor in the target window and returns
+    (text, reason). The text is None when it could not be read, and the reason
+    says why. Ctrl+Shift+Home selects from the cursor back to the start, Ctrl+C
+    copies, and Right collapses the selection so the cursor is where it was.
+    The clipboard is put back the way it was."""
+    locked_window = settings.get("locked_window", "")
+    if locked_window and HAS_PYGETWINDOW:
+        active = gw.getActiveWindow()
+        if (active.title if active else "") != locked_window:
+            return None, "the target window was not in front"
+    time.sleep(CHECK_SETTLE_SECONDS)
+    if stop_event.is_set():
+        return None, "the run was stopped"
+    ok, old_clipboard = _call_on_main_thread_and_wait(_read_clipboard_text)
+    if not ok:
+        return None, "the clipboard could not be read"
+
+    pyautogui.hotkey("ctrl", "shift", "home")
+    time.sleep(0.3)
+    pyautogui.hotkey("ctrl", "c")
+    found = None
+    waited = 0.0
+    while waited < CHECK_COPY_WAIT_SECONDS and not stop_event.is_set():
+        time.sleep(0.2)
+        waited += 0.2
+        ok, clipboard_now = _call_on_main_thread_and_wait(_read_clipboard_text)
+        if ok and clipboard_now is not None and clipboard_now != old_clipboard:
+            found = clipboard_now
+            break
+    pyautogui.press("right")
+
+    if found is None and old_clipboard is not None and normalize_for_check(old_clipboard).endswith(
+        normalize_for_check(expected)
+    ):
+        found = old_clipboard  # the copy gave the same text that was already there
+    _call_on_main_thread_and_wait(lambda: _write_clipboard_text(old_clipboard))
+    if found is None:
+        return None, "copying from the window did not work (copy may be blocked there)"
+    return found, ""
+
+
+def run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path):
+    """Called by type_text() after the last character. A preview run is always
+    checked. A real run is checked only when 'Check typed text' is on. The result
+    goes in state.text_check_results and the log gets only counts and line
+    numbers, never the text. Returns quietly if Stop was pressed."""
+    preview = bool(settings.get("preview_mode"))
+    if not preview and not settings.get("check_typed_text", False):
+        return
+    expected = build_expected_typed_text(text, resume_from, left_mistake_map)
+    if not normalize_for_check(expected):
+        return
+    state.status = "Checking the typed text..."
+    file_name = os.path.basename(input_path)
+    record = {
+        "file": file_name, "preview": preview, "status": "unreadable", "reason": "",
+        "expected_length": len(normalize_for_check(expected)), "difference_count": 0, "differences": [],
+    }
+    try:
+        if preview:
+            ok, found = _call_on_main_thread_and_wait(_read_preview_text)
+            if not ok or found is None:
+                found, record["reason"] = None, "the Preview Run box could not be read"
+        else:
+            found, record["reason"] = _read_back_window_text(settings, expected)
+        if found is not None:
+            outcome = compare_typed_text(expected, found)
+            record["expected_length"] = outcome["expected_length"]
+            record["difference_count"] = outcome["difference_count"]
+            record["differences"] = outcome["differences"]
+            record["status"] = "match" if outcome["matched"] else "differences"
+    except Exception:
+        # Default to safety: a failed check must never spoil a finished run.
+        record["status"] = "unreadable"
+        record["reason"] = "the check ran into a problem"
+    if stop_event.is_set() and record["status"] == "unreadable":
+        return
+    state.text_check_results.append(record)
+    if record["status"] == "match":
+        log_event("text_check", f"matched, {record['expected_length']} characters")
+    elif record["status"] == "differences":
+        line_numbers = ", ".join(str(item["line"]) for item in record["differences"][:10])
+        log_event("text_check", f"{record['difference_count']} difference(s), first on line(s) {line_numbers}")
+    else:
+        log_event("text_check", f"could not check: {record['reason']}")
+
+
+def get_text_check_summary():
+    """One or two plain lines about the text check for the finished message,
+    or an empty string when no check ran."""
+    results = state.text_check_results
+    if not results:
+        return ""
+    problems = [item for item in results if item["status"] == "differences"]
+    unreadable = [item for item in results if item["status"] == "unreadable"]
+    if problems:
+        total = sum(item["difference_count"] for item in problems)
+        return f"Text check: {total} difference(s) found. A report opens next."
+    if unreadable:
+        return f"Text check: could not read the text back ({unreadable[0]['reason']})."
+    total_chars = sum(item["expected_length"] for item in results)
+    return f"Text check: all {total_chars:,} characters match."
+
+
+def build_text_check_report_text(results):
+    """The plain-text report for the Typed Text Check window."""
+    show_file_names = len(results) > 1
+    lines = []
+    for item in results:
+        name = f"{item['file']}: " if show_file_names else ""
+        where = "Preview" if item["preview"] else "Target window"
+        if item["status"] == "match":
+            lines.append(f"{name}OK. All {item['expected_length']:,} characters match ({where}).")
+        elif item["status"] == "unreadable":
+            lines.append(f"{name}Could not be checked: {item['reason']}.")
+        else:
+            lines.append(f"{name}{item['difference_count']} difference(s) in {item['expected_length']:,} characters ({where}).")
+            lines.append("")
+            for number, difference in enumerate(item["differences"], start=1):
+                lines.append(f"{number}. Line {difference['line']}: {difference['kind']}")
+                lines.append(f"     on screen:  {difference['on_screen']}")
+                lines.append(f"     should be:  {difference['should_be']}")
+                lines.append("")
+            if item["difference_count"] > len(item["differences"]):
+                lines.append(
+                    f"Only the first {len(item['differences'])} of {item['difference_count']} are listed."
+                )
+        lines.append("")
+    lines.append("The part to look at is shown between \u00ab \u00bb (\u21b5 is a line break).")
+    lines.append(
+        "Curly quotes, non-breaking spaces, and spaces at the very end are treated as the same "
+        "text. An editor's own autocorrect (like turning -- into a dash) can still show up here."
+    )
+    lines.append(
+        "Purposely left mistakes are expected and are not counted as differences."
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def open_text_check_report():
+    """Opens the Typed Text Check window for the most recent run. It opens by
+    itself when a check finds a difference or could not read the text back, and
+    the button on the Check Typed Text card opens it again."""
+    results = list(state.text_check_results)
+    if not results:
+        messagebox.showinfo(
+            "No Text Check Yet",
+            "No typed text has been checked yet.\n\n"
+            "Preview runs are always checked. For a real run, turn on 'Check typed text' "
+            "on the Hotkeys tab, then start a run.",
+        )
+        return
+    report_text = build_text_check_report_text(results)
+    report_win = modern_toplevel(window, "Typed Text Check", "780x580", (520, 340))
+    modern_label(
+        report_win,
+        get_text_check_summary(),
+        kind="muted",
+        wraplength=720,
+    ).pack(anchor="w", padx=12, pady=(10, 4))
+
+    report_box = modern_textbox(report_win)
+    report_box.insert("1.0", report_text)
+    report_box.configure(state=tk.DISABLED)
+    report_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    def copy_report():
+        window.clipboard_clear()
+        window.clipboard_append(report_text)
+
+    button_row = modern_frame(report_win)
+    button_row.pack(anchor="w", padx=12, pady=(0, 12))
+    modern_button(button_row, "Copy Report", copy_report, kind="primary").pack(side="left")
+    modern_button(button_row, "Close", report_win.destroy, kind="neutral").pack(side="left", padx=(8, 0))
+
+
+# --------------------------------------------
+# SESSION LOGGING
+# --------------------------------------------
+def log_event(event, detail=""):
+    """Append a timestamped event to the in-memory session log if
+    logging is currently enabled."""
+    if state.logging_enabled:
+        state.log_entries.append((datetime.now().isoformat(timespec="seconds"), event, detail))
+
+
+CSV_FORMULA_STARTERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def make_csv_cell_safe(value):
+    """Spreadsheet programs run any cell that starts with = + - or @ as a
+    formula. Log details can hold pieces of typed text or a window title, so
+    a leading apostrophe turns such a cell back into plain text."""
+    text = str(value)
+    if text.startswith(CSV_FORMULA_STARTERS):
+        return "'" + text
+    return text
+
+
+def export_log(auto=False):
+    """Write the current session log to a CSV file. When auto=True
+    (called automatically at the end of a run) the file is saved
+    next to the input file without prompting. When auto=False (the
+    'Export Log' button) the user is asked where to save it."""
+    if not state.log_entries:
+        if not auto:
+            messagebox.showinfo("No Log Data", "There is no session log data to export yet.")
+        return None
+
+    default_name = f"amanuensis_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+    if auto:
+        input_path = state.settings.get("input_path", "input.txt")
+        input_dir = os.path.dirname(os.path.abspath(input_path)) or "."
+        path = os.path.join(input_dir, default_name)
+    else:
+        path = filedialog.asksaveasfilename(
+            title="Export Session Log",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV files", "*.csv")],
+        )
+        if not path:
+            return None
+
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "event", "detail"])
+            for log_row in state.log_entries:
+                writer.writerow([make_csv_cell_safe(cell) for cell in log_row])
+        if not auto:
+            messagebox.showinfo("Log Exported", f"Session log saved to:\n{path}")
+        return path
+    except OSError as e:
+        if not auto:
+            messagebox.showerror("Export Failed", str(e))
+        return None
+
+
+
+def open_log_viewer():
+    """Open a Toplevel window showing the in-memory session log (state.log_entries)
+    in a ttk.Treeview table. Provides an 'Open Log File...' button to load a
+    previously-exported CSV into the same table, replacing whatever was shown.
+    Shows a 'No log data yet' message when the table is empty."""
+
+    viewer = modern_toplevel(window, "Session Log Viewer", "700x420", (500, 300))
+
+    # -- toolbar row --
+    toolbar = modern_frame(viewer)
+    toolbar.pack(fill="x", padx=12, pady=(10, 6))
+
+    source_label_var = tk.StringVar(value="")
+    modern_label(toolbar, textvariable=source_label_var, kind="muted").pack(side="left", fill="x", expand=True)
+
+    def load_csv_file():
+        """Ask the user for a CSV file and reload the treeview from it."""
+        path = filedialog.askopenfilename(
+            parent=viewer,
+            title="Open Log File",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                rows = [(r.get("timestamp", ""), r.get("event", ""), r.get("detail", "")) for r in reader]
+        except OSError as exc:
+            err_str = str(exc)
+            messagebox.showerror("Load Failed", f"Could not read file:\n{err_str}", parent=viewer)
+            return
+        except Exception as exc:
+            err_str = str(exc)
+            messagebox.showerror("Load Failed", f"Could not parse CSV:\n{err_str}", parent=viewer)
+            return
+        _populate_table(rows, source=os.path.basename(path))
+
+    modern_button(toolbar, "Open Log File...", load_csv_file, kind="neutral").pack(side="right")
+
+    # -- Treeview + scrollbars (the table itself is a native ttk.Treeview;
+    # CustomTkinter has no table widget, so it sits inside a rounded frame) --
+    tree_frame = modern_frame(viewer, bordered=True)
+    tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+    columns = ("timestamp", "event", "detail")
+    tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+    tree.heading("timestamp", text="Timestamp")
+    tree.heading("event", text="Event")
+    tree.heading("detail", text="Detail")
+    tree.column("timestamp", width=160, stretch=False, anchor="w")
+    tree.column("event", width=180, stretch=False, anchor="w")
+    tree.column("detail", width=300, stretch=True, anchor="w")
+
+    vsb = modern_scrollbar(tree_frame, tree.yview)
+    hsb = modern_scrollbar(tree_frame, tree.xview, horizontal=True)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+    tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=(12, 0))
+    vsb.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=(10, 0))
+    hsb.grid(row=1, column=0, sticky="ew", padx=(10, 0), pady=(0, 8))
+    tree_frame.rowconfigure(0, weight=1)
+    tree_frame.columnconfigure(0, weight=1)
+
+    # -- "no data" overlay label (shown when table is empty) --
+    no_data_label = modern_label(
+        tree_frame,
+        "No log data yet.\nRun a session with logging enabled, or open a previously-exported CSV file.",
+        kind="muted",
+    )
+
+    def _populate_table(rows, source="in-memory log"):
+        """Clear the treeview and insert rows. Shows/hides the no-data overlay."""
+        tree.delete(*tree.get_children())
+        if rows:
+            for ts, event, detail in rows:
+                tree.insert("", tk.END, values=(ts, event, detail))
+            no_data_label.place_forget()
+            source_label_var.set(f"Source: {source}  \u2022  {len(rows)} row(s)")
+        else:
+            # Place the label centred over the treeview area
+            no_data_label.place(relx=0.5, rely=0.5, anchor="center", in_=tree_frame)
+            source_label_var.set("")
+
+    # Populate immediately from in-memory log
+    _populate_table(state.log_entries, source="last session (in-memory)")
+
+
+# --------------------------------------------
+# PREVIEW MODE (Preview Run button)
+# --------------------------------------------
+# When settings["preview_mode"] is True, type_text() runs completely
+# unchanged -- same delays, pauses, mistakes, typos, and reworks --
+# except its pyautogui call sites are routed through these three
+# helpers instead of calling pyautogui directly. In preview mode they
+# write into the Preview Run Toplevel's Text box (via
+# run_on_main_thread, since type_text() always runs on the background
+# typing thread) instead of sending real keystrokes.
+preview_text_widget = None  # the active Preview Run Text widget, or None when no preview is open
+
+# PREVIEW SPEED (Update #53): how fast the Preview Run box plays. 1x is the real
+# pace. Only the waiting is shortened, so the same text, mistakes, and pauses
+# happen in the same order, just sooner. Real runs always use real time.
+PREVIEW_SPEED_CHOICES = (1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 5.0, 10.0, 20.0)
+PREVIEW_SPEED_DEFAULT = 1.0
+preview_speed_now = PREVIEW_SPEED_DEFAULT  # read by the typing thread, changed in the Preview Run window
+
+
+def preview_speed_label(speed):
+    """Text for a speed choice, such as '1x' or '1.25x'."""
+    return f"{speed:g}x"
+
+
+def clamp_preview_speed(value):
+    """Returns the allowed preview speed closest to value. A number between two
+    choices snaps to the nearest one. Anything that is not a usable number
+    (including text like 'fast') gives the default, 1x."""
+    try:
+        number = float(str(value).strip().lower().rstrip("x"))
+    except (ValueError, TypeError):
+        return PREVIEW_SPEED_DEFAULT
+    if not math.isfinite(number):
+        return PREVIEW_SPEED_DEFAULT
+    return min(PREVIEW_SPEED_CHOICES, key=lambda choice: abs(choice - number))
+
+
+def _current_preview_speed():
+    """The speed the typing thread should use right now. Always 1.0 (real time)
+    unless the run is a preview."""
+    if state.settings.get("preview_mode"):
+        return preview_speed_now
+    return 1.0
+
+
+def paced_sleep(seconds):
+    """time.sleep() for the typing loop. In a preview it waits `seconds` divided
+    by the preview speed, and in a real run it waits the full time."""
+    time.sleep(seconds / _current_preview_speed())
+
+
+def _preview_write(text):
+    """Runs on the main thread via run_on_main_thread. Appends text
+    to the preview Text box and scrolls to the end."""
+    if preview_text_widget is None:
+        return
+    try:
+        preview_text_widget.configure(state=tk.NORMAL)
+        preview_text_widget.insert(tk.END, text)
+        preview_text_widget.see(tk.END)
+        preview_text_widget.configure(state=tk.DISABLED)
+    except tk.TclError:
+        pass
+
+
+def _preview_backspace(count=1):
+    """Runs on the main thread via run_on_main_thread. Deletes the
+    last `count` characters from the preview Text box."""
+    if preview_text_widget is None:
+        return
+    try:
+        preview_text_widget.configure(state=tk.NORMAL)
+        preview_text_widget.delete(f"end-{count + 1}c", "end-1c")
+        preview_text_widget.see(tk.END)
+        preview_text_widget.configure(state=tk.DISABLED)
+    except tk.TclError:
+        pass
+
+
+def _preview_replace_near_end(distance, remove_count, new_text):
+    """Runs on the main thread via run_on_main_thread. The Preview Run box has
+    no cursor to move, so the second revision pass (Update #34) swaps the
+    word in one step: it replaces `remove_count` characters that sit
+    `distance` characters before the end of the preview text with new_text."""
+    if preview_text_widget is None:
+        return
+    try:
+        preview_text_widget.configure(state=tk.NORMAL)
+        preview_text_widget.delete(f"end-1c-{distance + remove_count}c", f"end-1c-{distance}c")
+        # After the delete, the spot is `distance` characters from the end.
+        preview_text_widget.insert(f"end-1c-{distance}c", new_text)
+        preview_text_widget.see(tk.END)
+        preview_text_widget.configure(state=tk.DISABLED)
+    except tk.TclError:
+        pass
+
+
+# --------------------------------------------
+# REAL KEY PRESS TIMING (hold time, held Shift, overlap)
+# --------------------------------------------
+# By default every character is sent with keyboard.write(), which presses and
+# releases the key in one instant. With Key Press Timing on, a plain letter or
+# the space bar is pressed down, held for a short random time, and then
+# released. Capital letters hold Shift around the letter, and an optional
+# overlap lets the next key go down just before the last one comes up.
+#
+# Only a-z, A-Z, and space use this. Pressing a digit or punctuation key by
+# name can type a different character on a non-US keyboard layout (on an
+# AZERTY keyboard, the 1 key types an ampersand), so those characters keep
+# using keyboard.write(). The same fallback is used when a key cannot be
+# pressed by name at all.
+KEY_HOLD_MIN_MS_DEFAULT = 40.0
+KEY_HOLD_MAX_MS_DEFAULT = 110.0
+KEY_HOLD_LIMIT_MIN_MS = 10.0
+KEY_HOLD_LIMIT_MAX_MS = 500.0
+KEY_OVERLAP_CHANCE_DEFAULT = 30.0
+KEY_OVERLAP_CHANCE_MAX = 100.0
+# Overlap only happens when the gap before the next key is this short or less.
+KEY_OVERLAP_MAX_GAP_SECONDS = 0.14
+KEY_OVERLAP_SECONDS = (0.012, 0.045)
+KEY_SHIFT_LEAD_SECONDS = (0.015, 0.045)
+KEY_SHIFT_TRAIL_SECONDS = (0.010, 0.035)
+KEY_MULTI_CHAR_GAP_SECONDS = (0.02, 0.05)
+# A key an overlap left down is released by this safety timer if nothing else
+# released it first. It is shorter than the shortest Windows key repeat delay
+# (about 0.25 seconds), so a held key can never start auto-repeating.
+KEY_WATCHDOG_SECONDS = 0.2
+
+# The names of the keys this run has pressed down and not released yet.
+# Both threads can reach this list (the typing thread and the Stop button), so
+# every change to it happens while holding the lock.
+_held_keys = []
+_held_keys_lock = threading.Lock()
+_held_key_timer = [None]
+
+
+def clean_key_hold_ms(value, fallback):
+    """Returns `value` as a hold time in milliseconds, limited to the allowed
+    range. Anything unreadable, NaN, or infinite gives `fallback`."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(number):
+        return fallback
+    return min(max(number, KEY_HOLD_LIMIT_MIN_MS), KEY_HOLD_LIMIT_MAX_MS)
+
+
+def draw_key_hold_seconds(min_ms, max_ms, rng=None):
+    """Draws how long one key stays down, in seconds, from the range given in
+    milliseconds. A swapped or unreadable range is cleaned first."""
+    low = clean_key_hold_ms(min_ms, KEY_HOLD_MIN_MS_DEFAULT)
+    high = clean_key_hold_ms(max_ms, KEY_HOLD_MAX_MS_DEFAULT)
+    if low > high:
+        low, high = high, low
+    source = rng if rng is not None else random
+    return source.uniform(low, high) / 1000.0
+
+
+def plan_key_press(char, shift_hold=True):
+    """Says how to press `char` with a held key, as (key name, needs Shift), or
+    returns None when the character must be typed the old way (keyboard.write).
+    Only plain ASCII letters and the space bar qualify. A capital letter needs
+    Shift held, and is left to the old way when `shift_hold` is off."""
+    if not isinstance(char, str) or len(char) != 1:
+        return None
+    if "a" <= char <= "z":
+        return (char, False)
+    if "A" <= char <= "Z":
+        if not shift_hold:
+            return None
+        return (char.lower(), True)
+    if char == " ":
+        return ("space", False)
+    return None
+
+
+def are_opposite_hand_letters(first, second):
+    """True when both are plain lowercase letters and a different hand types
+    each one (the QWERTY map in FINGER_FOR_LETTER)."""
+    if not isinstance(first, str) or not isinstance(second, str):
+        return False
+    first_finger = FINGER_FOR_LETTER.get(first)
+    second_finger = FINGER_FOR_LETTER.get(second)
+    if first_finger is None or second_finger is None:
+        return False
+    return first_finger[0] != second_finger[0]
+
+
+def should_overlap_keys(char, next_char, gap_seconds, chance_percent, rng=None):
+    """Decides whether `char` stays down until `next_char` goes down. Only for a
+    quick pair of lowercase letters typed by opposite hands, and only with the
+    chance given (0 to 100). A slow gap never overlaps."""
+    if not are_opposite_hand_letters(char, next_char):
+        return False
+    try:
+        gap = float(gap_seconds)
+        chance = float(chance_percent)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(gap) and math.isfinite(chance)):
+        return False
+    if gap > KEY_OVERLAP_MAX_GAP_SECONDS or chance <= 0:
+        return False
+    source = rng if rng is not None else random
+    return source.uniform(0, 100) < chance
+
+
+def _cancel_key_watchdog():
+    """Stops the safety timer, if one is waiting."""
+    with _held_keys_lock:
+        timer = _held_key_timer[0]
+        _held_key_timer[0] = None
+    if timer is not None:
+        timer.cancel()
+
+
+def _start_key_watchdog():
+    """Starts the safety timer that releases every held key shortly after."""
+    _cancel_key_watchdog()
+    timer = threading.Timer(KEY_WATCHDOG_SECONDS, release_all_held_keys)
+    timer.daemon = True
+    with _held_keys_lock:
+        _held_key_timer[0] = timer
+    timer.start()
+
+
+def _release_key_quietly(name):
+    """Sends a key-up for `name`. A failure is ignored on purpose: this is only
+    ever called to put a key back, and there is nothing safer to do than try."""
+    try:
+        keyboard.release(name)
+    except Exception:
+        pass
+
+
+def release_all_held_keys():
+    """Releases every key this app is holding down. Safe to call from any
+    thread, at any time, and as often as needed: with nothing held it does
+    nothing. Called when Stop is pressed, when a run ends, and by the safety
+    timer, so a key can never be left stuck down."""
+    with _held_keys_lock:
+        timer = _held_key_timer[0]
+        _held_key_timer[0] = None
+        names = list(reversed(_held_keys))
+        del _held_keys[:]
+    if timer is not None:
+        timer.cancel()
+    for name in names:
+        _release_key_quietly(name)
+
+
+def _hold_key_down(name):
+    """Presses `name` down and remembers it so it can always be released."""
+    keyboard.press(name)
+    with _held_keys_lock:
+        _held_keys.append(name)
+
+
+def _release_held_key(name):
+    """Releases one key that _hold_key_down() pressed."""
+    with _held_keys_lock:
+        if name in _held_keys:
+            _held_keys.remove(name)
+    _release_key_quietly(name)
+
+
+def _press_key_with_timing(settings, char, allow_overlap=False, keep_down=False):
+    """Types one character as a real key press with a hold time. Returns the
+    seconds spent holding and waiting, so the typing loop can shorten its own
+    gap by that much and keep the chosen speed.
+
+    allow_overlap: a key left down by the last character (see keep_down) may
+    be released after this key goes down. Without it, any key still down is
+    released first.
+    keep_down: leave this key down for the next character to release. Only
+    used for a lowercase letter (never with Shift), and the safety timer will
+    release it if the next character does not."""
+    plan = plan_key_press(char, settings.get("enable_shift_hold", True))
+    if plan is None:
+        release_all_held_keys()
+        keyboard.write(char)
+        return 0.0
+
+    key_name, needs_shift = plan
+    hold_seconds = draw_key_hold_seconds(
+        settings.get("key_hold_min_ms", KEY_HOLD_MIN_MS_DEFAULT),
+        settings.get("key_hold_max_ms", KEY_HOLD_MAX_MS_DEFAULT),
+    )
+    with _held_keys_lock:
+        earlier_keys = list(_held_keys)
+    if earlier_keys and (not allow_overlap or needs_shift):
+        release_all_held_keys()
+        earlier_keys = []
+
+    spent = 0.0
+    key_is_down = False
+    shift_is_down = False
+    leave_down = False
+    typed = False
+    failed = False
+    try:
+        if needs_shift:
+            _hold_key_down("shift")
+            shift_is_down = True
+            lead = random.uniform(*KEY_SHIFT_LEAD_SECONDS)
+            time.sleep(lead)
+            spent += lead
+        _hold_key_down(key_name)
+        key_is_down = True
+        typed = True
+        if earlier_keys:
+            _cancel_key_watchdog()
+            overlap = random.uniform(*KEY_OVERLAP_SECONDS)
+            time.sleep(overlap)
+            spent += overlap
+            for earlier in earlier_keys:
+                _release_held_key(earlier)
+            hold_seconds = max(0.0, hold_seconds - overlap)
+        if keep_down and not needs_shift:
+            leave_down = True
+            _start_key_watchdog()
+        else:
+            time.sleep(hold_seconds)
+            spent += hold_seconds
+            _release_held_key(key_name)
+            key_is_down = False
+            if needs_shift:
+                trail = random.uniform(*KEY_SHIFT_TRAIL_SECONDS)
+                time.sleep(trail)
+                spent += trail
+                _release_held_key("shift")
+                shift_is_down = False
+    except (ValueError, KeyError, OSError):
+        # The key could not be pressed by name (for example a non-Latin layout).
+        failed = True
+    finally:
+        # Whatever happened, never leave this character's keys down. The one
+        # exception is a key an overlap purposely left down for the next
+        # character, which the safety timer and Stop always release.
+        if not leave_down:
+            if key_is_down:
+                _release_held_key(key_name)
+            if shift_is_down:
+                _release_held_key("shift")
+    if failed and not typed:
+        keyboard.write(char)
+    return spent
+
+
+def _send_text_with_key_timing(settings, text, allow_overlap=False, keep_down=False):
+    """Types `text` one key at a time with hold times. A run of several
+    characters (a sentence-rework redo) gets a short human gap between its keys.
+    Returns the seconds spent holding and waiting."""
+    spent = 0.0
+    last_position = len(text) - 1
+    for position, char in enumerate(text):
+        if position > 0:
+            time.sleep(random.uniform(*KEY_MULTI_CHAR_GAP_SECONDS))
+        spent += _press_key_with_timing(
+            settings,
+            char,
+            allow_overlap=(allow_overlap and position == 0),
+            keep_down=(keep_down and position == last_position),
+        )
+    return spent
+
+
+def _send_char(settings, text, allow_overlap=False, keep_down=False):
+    """Types `text` (a single character, or a short run of characters
+    for a sentence-rework redo) as real keystrokes via keyboard.write(),
+    or -- when settings['preview_mode'] is True -- into the Preview Run
+    Text box instead. Always called from the background typing
+    thread, so the preview write is routed through run_on_main_thread().
+
+    With settings['enable_key_hold'] on (Update #59), each key is pressed and
+    held for a short time instead (see _press_key_with_timing()). Returns the
+    seconds spent holding, which is 0.0 in every other case. allow_overlap and
+    keep_down are only used by the main typing loop."""
+    if settings.get("preview_mode"):
+        run_on_main_thread(lambda t=text: _preview_write(t))
+        return 0.0
+    if settings.get("enable_key_hold"):
+        return _send_text_with_key_timing(settings, text, allow_overlap, keep_down)
+    keyboard.write(text)
+    return 0.0
+
+
+def _send_backspace(settings):
+    """Presses Backspace once, or -- in preview mode -- removes the
+    last character from the Preview Run Text box."""
+    if settings.get("preview_mode"):
+        run_on_main_thread(lambda: _preview_backspace(1))
+    else:
+        # A key an overlap left down must come up before another key is sent.
+        release_all_held_keys()
+        pyautogui.press("backspace")
+
+
+def _erase_typed_text(settings, count):
+    """Presses Backspace exactly `count` times, one per character, in a quick
+    burst like a held key. Used to undo text that was just typed (sentence
+    reworks and paraphrase drafts). It counts characters on purpose and never
+    uses Ctrl+Backspace: editors disagree about where a word ends (commas,
+    apostrophes, and hyphens), and a wrong guess leaves text behind or deletes
+    too much (Update #52). It always finishes once started, even if Stop is
+    pressed, so a half-deleted sentence is never left on screen."""
+    for _ in range(count):
+        _send_backspace(settings)
+        paced_sleep(random.uniform(0.02, 0.06))
+
+
+_REWORK_WORD_PATTERN = re.compile(r"[^ ]+")
+
+
+def get_rework_text(recent_typed_text, word_count):
+    """Returns the exact tail of `recent_typed_text` that starts at the first of
+    its last `word_count` words and runs to the end, spaces and all, or an empty
+    string when there are not that many words. Because it is exactly what is on
+    screen, deleting len() characters and typing it again changes nothing, even
+    with double spaces or a word cut off at the start of the buffer (Update #52)."""
+    words = list(_REWORK_WORD_PATTERN.finditer(recent_typed_text))
+    if word_count < 1 or len(words) < word_count:
+        return ""
+    return recent_typed_text[words[-word_count].start():]
+
+
+def _send_format_toggle(settings, kind):
+    """Presses Ctrl+B (bold) or Ctrl+I (italic), which toggles that style in
+    Google Docs and Word. In preview mode nothing is pressed, because the
+    shortcut would go to whatever window has focus instead of the preview."""
+    if settings.get("preview_mode"):
+        return
+    pyautogui.hotkey("ctrl", FORMAT_SHORTCUT_LETTER[kind])
+
+
+def _press_format_toggles(settings, kinds, active_formats):
+    """Presses the shortcut for each style in `kinds`, with a short human
+    pause before and after, and keeps the `active_formats` set (the styles
+    that are on right now) up to date. Returns False if Stop was requested."""
+    for kind in kinds:
+        if stop_event.is_set():
+            return False
+        paced_sleep(random.uniform(0.15, 0.35))  # reaching for the shortcut
+        _send_format_toggle(settings, kind)
+        if kind in active_formats:
+            active_formats.discard(kind)
+            log_event("format_off", kind)
+        else:
+            active_formats.add(kind)
+            log_event("format_on", kind)
+        paced_sleep(random.uniform(0.05, 0.12))
+    return not stop_event.is_set()
+
+
+# --------------------------------------------
+# EDITOR TYPE (Update #58)
+# --------------------------------------------
+# Editors change what is typed into them. Google Docs and Word turn "1. " or
+# "- " at the start of a line into a real list, and code editors add their own
+# indentation after Enter. The Editor Type setting adds a few extra keys at the
+# start of a line so the text on screen still matches the file. Plain text
+# adds nothing. Every extra key was chosen so that if the editor does not
+# behave as expected, nothing is deleted: the worst case is the same text a
+# plain run would type. Preview runs never press these keys.
+EDITOR_MODE_PLAIN = "Plain text"
+EDITOR_MODE_DOCS = "Google Docs or Word"
+EDITOR_MODE_CODE = "Code editor"
+EDITOR_MODES = (EDITOR_MODE_PLAIN, EDITOR_MODE_DOCS, EDITOR_MODE_CODE)
+EDITOR_ACTION_CLEAR_INDENT = "clear_indent"
+EDITOR_ACTION_LIST_MARKER = "list_marker"
+# A list marker at the start of a line: up to 12 spaces or tabs, then 1 to 3
+# digits or one letter followed by . or ), or a bullet (- * + or a round
+# bullet), then one space.
+EDITOR_LIST_MARKER_PATTERN = re.compile(r"([ \t]{0,12})((?:[0-9]{1,3}|[A-Za-z])[.)]|[-*+\u2022]) ")
+
+
+def normalize_editor_mode(value):
+    """Returns a known editor type, or Plain text for anything else (settings
+    and profile files are untrusted input)."""
+    return value if value in EDITOR_MODES else EDITOR_MODE_PLAIN
+
+
+def find_editor_list_marker(text, idx):
+    """If the line that starts at text[idx] begins with a list marker, returns
+    (leading_spaces, marker), like ("", "1.") for "1. First" or ("  ", "-") for
+    "  - Item". Returns None when idx is not the start of a line or there is no
+    marker."""
+    if not 0 <= idx < len(text) or not (idx == 0 or text[idx - 1] == "\n"):
+        return None
+    found = EDITOR_LIST_MARKER_PATTERN.match(text, idx)
+    if found is None:
+        return None
+    return found.group(1), found.group(2)
+
+
+def plan_editor_line_start(mode, text, idx):
+    """Decides what extra keys the editor type needs before the character at
+    text[idx] is typed. Returns None, or (kind, leading_spaces, marker).
+      Code editor: clear the editor's own indent on every line after the first.
+      Google Docs or Word: type a list marker in a different key order."""
+    mode = normalize_editor_mode(mode)
+    if mode == EDITOR_MODE_CODE:
+        if 0 < idx <= len(text) and text[idx - 1] == "\n":
+            return (EDITOR_ACTION_CLEAR_INDENT, "", "")
+        return None
+    if mode == EDITOR_MODE_DOCS:
+        found = find_editor_list_marker(text, idx)
+        if found is not None:
+            return (EDITOR_ACTION_LIST_MARKER, found[0], found[1])
+    return None
+
+
+def editor_marker_span_is_clear(start, length, blockers):
+    """True when none of the text positions from start up to start + length is
+    in any of the `blockers` (dictionaries or sets keyed by text position). The
+    list marker is typed as one unit, so it is only used when nothing else is
+    planned for those positions (a formatting shortcut, a pause marker, or a
+    purposely left mistake)."""
+    for position in range(start, start + length):
+        for blocker in blockers:
+            if position in blocker:
+                return False
+    return True
+
+
+def _run_editor_clear_indent(settings):
+    """Code editor: empties the line the cursor is on. Shift+Home selects the
+    editor's automatic indent, one space replaces the selection, and Backspace
+    removes that space. This works the same whether or not the editor added an
+    indent, and it never deletes the line above (an empty selection plus a
+    space plus Backspace changes nothing). Typing a space, not the line's own
+    first character, replaces the selection, because some editors wrap a
+    selection in brackets or quotes when one of those is typed. Does nothing in
+    a preview."""
+    if settings.get("preview_mode"):
+        return
+    paced_sleep(random.uniform(0.05, 0.12))
+    pyautogui.hotkey("shift", "home")
+    paced_sleep(random.uniform(0.04, 0.09))
+    _send_char(settings, " ")
+    paced_sleep(random.uniform(0.04, 0.09))
+    _send_backspace(settings)
+    paced_sleep(random.uniform(0.04, 0.09))
+
+
+def _run_editor_list_marker(settings, lead, marker, min_delay, max_delay):
+    """Google Docs or Word: types "1. " (or "- ") at the start of a line without
+    letting the editor turn it into a list. The editor makes the list when the
+    space is typed after the marker, so the space goes in first: leading
+    spaces, a space, Left, the marker, then Right to move past the space. The
+    text on screen ends up exactly the same, and nothing is ever deleted. It
+    always finishes once started (it is under 20 keys), so a Stop never leaves
+    the line half typed. Does nothing in a preview."""
+    if settings.get("preview_mode"):
+        return
+    for lead_char in lead:
+        _send_char(settings, lead_char)
+        paced_sleep(random.uniform(min_delay, max_delay))
+    _send_char(settings, " ")
+    paced_sleep(random.uniform(min_delay, max_delay))
+    pyautogui.press("left")
+    paced_sleep(random.uniform(0.04, 0.10))
+    for marker_char in marker:
+        _send_char(settings, marker_char)
+        paced_sleep(random.uniform(min_delay, max_delay))
+    pyautogui.press("right")
+    paced_sleep(random.uniform(0.04, 0.10))
+
+
+def _fail_and_stop(title, message):
+    """Runs on the main thread (via run_on_main_thread). Shows an
+    error dialog, then stops the session -- kept separate from
+    stop_typing() so the background typing thread never calls
+    Tkinter directly, only ever queues a request to do so."""
+    messagebox.showerror(title, message)
+    stop_typing()
+
+
+def _info_and_stop(title, message):
+    messagebox.showinfo(title, message)
+    stop_typing()
+
+
+# --------------------------------------------
+# ACTIVITY WATCHER (Auto-Pause on Mouse Activity)
+# --------------------------------------------
+# When auto_pause_activity is enabled, this background watcher runs
+# concurrently with typing. It samples cursor position every 100ms.
+# If physical mouse movement exceeding the configured pixel sensitivity
+# is detected, it triggers pause_event and notifies the user via the
+# status bar. Resuming typing uses the normal resume control (button/hotkey).
+
+
+# --------------------------------------------
+# AUTO-PAUSE ALERT (Update #54)
+# --------------------------------------------
+# A short beep when typing pauses BY ITSELF (the locked window lost focus, or
+# mouse movement triggered Auto-pause on activity). It is for hands-free users
+# who are not watching the screen. A pause the person asks for (button or
+# hotkey) never beeps. It is a different sound from the finished sound, and it
+# does not depend on the Play sound when finished checkbox.
+def play_auto_pause_alert():
+    """Plays the auto-pause beep. Does nothing where winsound is missing."""
+    if not HAS_WINSOUND:
+        return
+    try:
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    except Exception:
+        pass
+
+
+def alert_auto_pause(settings):
+    """Called from the typing thread the moment a run auto-pauses. Beeps once if
+    the person turned the alert on. Preview runs never beep. The beep goes
+    through run_on_main_thread() like every other action from a background thread."""
+    if not settings.get("alert_on_auto_pause", False) or settings.get("preview_mode"):
+        return
+    run_on_main_thread(play_auto_pause_alert)
+
+
+def _activity_watcher(sensitivity, alert=False):
+    """Monitors mouse cursor position while typing is active.
+    If the cursor moves more than `sensitivity` pixels from its resting position,
+    triggers an automatic pause via the existing pause mechanism. When `alert`
+    is True, the pause also plays the auto-pause beep (Update #54).
+    All GUI calls are safely routed through run_on_main_thread()."""
+    try:
+        last_pos = pyautogui.position()
+    except Exception:
+        last_pos = (0, 0)
+
+    while not stop_event.is_set() and state.is_running:
+        time.sleep(0.1)
+        if stop_event.is_set() or not state.is_running:
+            break
+
+        # During countdown, the user is switching to the target window -- don't pause,
+        # just keep updating last_pos to the user's cursor position. The same goes for
+        # a long session break (target time): the person is expected to be away or
+        # busy, and may click back into the document when the break is ending.
+        if (state.status.startswith("Starting in") or state.status == "Countdown..."
+                or state.status.startswith("Session break")
+                or state.status.startswith("Waiting to start")):
+            try:
+                last_pos = pyautogui.position()
+            except Exception:
+                pass
+            continue
+
+        # While already paused or focus lost, keep updating last_pos so resuming
+        # doesn't immediately re-trigger a pause.
+        if pause_event.is_set() or focus_lost_event.is_set():
+            try:
+                last_pos = pyautogui.position()
+            except Exception:
+                pass
+            continue
+
+        try:
+            curr_pos = pyautogui.position()
+        except Exception:
+            continue
+
+        dx = curr_pos[0] - last_pos[0]
+        dy = curr_pos[1] - last_pos[1]
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist >= sensitivity:
+            pause_event.set()
+            state.status = "Activity detected \u2014 paused"
+            log_event("activity_pause", f"mouse moved {dist:.1f}px")
+            run_on_main_thread(lambda: btn_pause.configure(text="Resume Typing"))
+            if alert:
+                run_on_main_thread(play_auto_pause_alert)
+            last_pos = curr_pos
+
+
+# --------------------------------------------
+# TARGET TIME TILL COMPLETION (Update #27)
+# --------------------------------------------
+# The person picks how long the whole run should take. Amanuensis first
+# estimates how long the typing itself will take. The spare time that is left
+# goes into long "session breaks", the way a person writes a long piece over
+# several sittings instead of in one go. A longer target means longer breaks
+# (an hour or more at a time for a target of several hours).
+#
+# How it works:
+#   1. plan_session_breaks() runs once before typing starts. It decides how
+#      many breaks there are, where they happen (paragraph starts first, then
+#      sentence starts), and how big each break is compared to the others
+#      (its "weight").
+#   2. Right before each break, compute_session_break_seconds() works out its
+#      real length from the time that is actually left. If typing ran slower or
+#      faster than estimated, the later breaks absorb the difference, so the
+#      run finishes close to the target.
+#   3. Time the person spends paused is not counted against the target.
+#
+# Safety rules (do not weaken these):
+#   * A break never happens inside [[protected text]].
+#   * Amanuensis never types faster than the speed settings. A target that is
+#     shorter than the typing time simply cannot be reached.
+#   * Preview runs ignore the target, so a preview never waits for hours.
+TARGET_TIME_MIN_SECONDS = 60.0
+TARGET_TIME_MAX_HOURS = 48
+SESSION_BREAK_MIN_BUDGET_SECONDS = 120.0  # spare time needed before any break is planned
+SESSION_BREAK_MIN_SECONDS = 30.0  # a break that would be shorter than this is skipped
+SESSION_BREAK_MAX_SECONDS = 6 * 3600.0  # no single break is longer than this
+SESSION_BREAK_MAX_COUNT = 60
+SESSION_BREAK_EDGE_FRACTION = 0.03  # keep breaks away from the very start and very end
+SESSION_BREAK_RESUME_SECONDS = 10  # warning countdown after a break when no window is locked
+SESSION_PACE_MIN_ESTIMATE_SECONDS = 60.0  # too little typing so far to judge the pace
+
+# START COUNTDOWN (Update #43): the wait before typing begins, so the person can
+# switch to the target window. Whole seconds, from 0 (no wait) to 60.
+START_COUNTDOWN_DEFAULT = 10
+START_COUNTDOWN_MAX = 60
+
+
+def clamp_start_countdown(seconds):
+    """Returns the start countdown as a whole number of seconds between 0 and
+    START_COUNTDOWN_MAX. Anything that is not a usable number gives the default."""
+    try:
+        value = float(seconds)
+    except (ValueError, TypeError):
+        return START_COUNTDOWN_DEFAULT
+    if not math.isfinite(value):
+        return START_COUNTDOWN_DEFAULT
+    return int(max(0, min(round(value), START_COUNTDOWN_MAX)))
+
+
+# APP TEXT SIZE (Update #48): how large the text and buttons of the whole app
+# are, as a percent of the normal size. Only these choices are allowed, so a
+# damaged settings file can never make the app unusably big or small.
+TEXT_SIZE_CHOICES = (100, 125, 150, 175, 200)
+TEXT_SIZE_DEFAULT = 100
+
+
+def clamp_text_size_percent(value):
+    """Returns the allowed text size percent closest to value. A number between
+    two choices snaps to the nearest one. Anything that is not a usable number
+    (including text like 'big') gives the default."""
+    try:
+        number = float(str(value).strip().rstrip("%"))
+    except (ValueError, TypeError):
+        return TEXT_SIZE_DEFAULT
+    if not math.isfinite(number):
+        return TEXT_SIZE_DEFAULT
+    return min(TEXT_SIZE_CHOICES, key=lambda choice: abs(choice - number))
+
+
+# SCHEDULED START (Update #46): the person picks a clock time and the run waits
+# for it. A time that has already passed today means the same time tomorrow.
+SCHEDULED_START_DEFAULT = "9:00 AM"
+SCHEDULE_GRACE_SECONDS = 300  # a computer that wakes this late (or later) cancels the run
+SCHEDULE_POLL_SECONDS = 0.5  # how often the wait checks the clock and the Stop button
+SCHEDULE_CLOCK_PATTERN = re.compile(r"^(\d{1,2})(?::(\d{2}))?(am|pm)?$")
+
+
+def parse_clock_time(text):
+    """Turns a typed clock time such as '15:30', '3:30 PM', '3pm', or '9 a.m.'
+    into (hour, minute) on a 24-hour clock. Returns None when it cannot be
+    read. A bare number such as '3' is refused, because it could mean 3 AM or
+    3 PM."""
+    if not isinstance(text, str):
+        return None
+    cleaned = re.sub(r"\s+", "", text.strip().lower()).replace(".", "")
+    match = SCHEDULE_CLOCK_PATTERN.match(cleaned)
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute_text = match.group(2)
+    suffix = match.group(3)
+    if minute_text is None and suffix is None:
+        return None
+    minute = int(minute_text) if minute_text is not None else 0
+    if minute > 59:
+        return None
+    if suffix:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if suffix == "pm" else 0)
+    elif hour > 23:
+        return None
+    return hour, minute
+
+
+def format_clock_time(hour, minute):
+    """Returns a clock time such as '3:30 PM' (12-hour clock, no leading zero)."""
+    suffix = "AM" if hour < 12 else "PM"
+    return f"{hour % 12 or 12}:{minute:02d} {suffix}"
+
+
+def next_scheduled_datetime(clock, now=None):
+    """Returns the next moment the clock time (hour, minute) happens, as a
+    datetime. A time that is now or already past today means tomorrow."""
+    now = now if now is not None else datetime.now()
+    target = now.replace(hour=clock[0], minute=clock[1], second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+def format_duration_text(seconds):
+    """Turns seconds into short text such as '45s', '12m 05s', or '7h 30m'."""
+    total = max(int(seconds + 0.5), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def estimate_active_seconds(text, settings, protection_mask, pause_map, start, end):
+    """Rough typing time for text[start:end], using the same estimate as the
+    pre-start time estimate. Inline {{pause:N}} markers inside the range count
+    too. Session breaks are NOT included, because they are what is being planned."""
+    if end <= start:
+        return 0.0
+    segment = text[start:end]
+    segment_mask = protection_mask[start:end]
+    marker_seconds = sum(secs for pos, secs in pause_map.items() if start <= pos < end)
+    _words, _chars, seconds = estimate_typing_time(
+        segment, settings, segment_mask, marker_seconds, essay_context=(start, len(text))
+    )
+    return seconds
+
+
+def plan_session_break_count(spare_seconds):
+    """How many long breaks to plan for this much spare time. The count grows
+    with the square root of the spare time, so a longer target gets more breaks
+    and each break is longer too (about 5 breaks for 1 hour of spare time and
+    about 11 for 6 hours)."""
+    if spare_seconds < SESSION_BREAK_MIN_BUDGET_SECONDS:
+        return 0
+    minutes = spare_seconds / 60.0
+    count = int(round(0.6 * (minutes ** 0.5)))
+    return min(max(count, 1), SESSION_BREAK_MAX_COUNT)
+
+
+def _session_break_whitespace_before(text, index):
+    """Looks at the run of whitespace just before `index`. Returns how many
+    newlines it holds and the character right before the run."""
+    newline_count = 0
+    cursor = index
+    while cursor > 0 and text[cursor - 1].isspace():
+        cursor -= 1
+        if text[cursor] == "\n":
+            newline_count += 1
+    previous_char = text[cursor - 1] if cursor > 0 else ""
+    return newline_count, previous_char
+
+
+def _session_break_is_real_sentence_end(punct, previous_token):
+    """False when a period only ends an abbreviation ("Dr.", "e.g."), a single
+    initial, a list number, or a web address, so a break never lands there."""
+    if not punct.endswith("."):
+        return True  # ! and ? always end a sentence
+    token = previous_token.strip(SMART_TRAILING_PUNCT + "([\"'").lower()
+    if not token:
+        return False
+    if token in SMART_ABBREVIATIONS or token in SMART_ROMAN_NUMERALS:
+        return False
+    if len(token) == 1 and token.isalpha():
+        return False
+    if "." in token or _smart_looks_technical(token):
+        return False
+    return True
+
+
+def find_session_break_candidates(text, protection_mask, start_index):
+    """Finds the places where a person would naturally stop for a while.
+    Returns (paragraph_starts, sentence_starts). Each number is the index of the
+    first character of the next paragraph or sentence, and the break happens
+    just before that character is typed. Spots inside [[protected text]], near
+    the very start or end, or in the middle of a hard-wrapped line are skipped."""
+    paragraph_starts = []
+    sentence_starts = []
+    text_length = len(text)
+    edge = int((text_length - start_index) * SESSION_BREAK_EDGE_FRACTION)
+    first_allowed = start_index + edge
+    last_allowed = text_length - 1 - edge
+    for index, punct, previous_token in _smart_sentence_starts(text):
+        if index <= first_allowed or index > last_allowed or index >= text_length:
+            continue
+        if protection_mask[index - 1] and protection_mask[index]:
+            continue  # inside protected text
+        newline_count, previous_char = _session_break_whitespace_before(text, index)
+        if newline_count > 0:
+            # A new paragraph: a blank line, or a line that ended a sentence.
+            # A single newline after a word is a hard-wrapped line, so skip it.
+            if newline_count >= 2 or previous_char in ".!?:\"'\u201d\u2019)":
+                paragraph_starts.append(index)
+        elif punct and _session_break_is_real_sentence_end(punct, previous_token):
+            sentence_starts.append(index)
+    return paragraph_starts, sentence_starts
+
+
+def _nearest_unused_position(candidates, ideal, used, max_distance):
+    """The candidate closest to `ideal` that is not already used, or None if
+    there is none (or none within max_distance, when a limit is given)."""
+    best = None
+    best_distance = None
+    for candidate in candidates:
+        if candidate in used:
+            continue
+        distance = abs(candidate - ideal)
+        if max_distance is not None and distance > max_distance:
+            continue
+        if best is None or distance < best_distance:
+            best = candidate
+            best_distance = distance
+    return best
+
+
+def choose_session_break_positions(paragraph_starts, sentence_starts, count, start_index, text_length, rng=random):
+    """Picks where the breaks go. They are spread across the text with some
+    random jitter, snapped to a paragraph start when one is close and to a
+    sentence start otherwise. Fewer breaks than `count` are returned when the
+    text has too few good spots."""
+    span = text_length - start_index
+    pool = sorted(set(paragraph_starts) | set(sentence_starts))
+    count = min(count, len(pool))
+    if count <= 0 or span <= 0:
+        return []
+    gap = span / (count + 1)
+    used = set()
+    for number in range(1, count + 1):
+        ideal = start_index + gap * number + rng.uniform(-0.3, 0.3) * gap
+        pick = _nearest_unused_position(paragraph_starts, ideal, used, 0.45 * gap)
+        if pick is None:
+            pick = _nearest_unused_position(pool, ideal, used, None)
+        # Never put two breaks right next to each other.
+        if pick is not None and all(abs(pick - other) >= 0.25 * gap for other in used):
+            used.add(pick)
+    return sorted(used)
+
+
+def make_session_break_weights(count, rng=random):
+    """Relative size of each break. Most are ordinary and some are much
+    longer, like a meal, a walk, or sleeping on it. With four or more breaks
+    at least one is a long one."""
+    weights = []
+    any_long = False
+    for _ in range(count):
+        weight = max(rng.lognormvariate(0.0, 0.45), 0.3)
+        if rng.random() < 0.25:
+            weight *= 2.5
+            any_long = True
+        weights.append(weight)
+    if count >= 4 and not any_long:
+        weights[rng.randrange(count)] *= 2.5
+    return weights
+
+
+def plan_session_breaks(text, protection_mask, pause_map, settings, start_index, target_seconds, rng=random):
+    """Plans the long session breaks for one file. Returns (breaks, spare_seconds,
+    typing_seconds). `breaks` is a list of {"position", "weight"} dicts in text
+    order. It is empty when the target leaves no spare time (or the text has no
+    good place to stop)."""
+    typing_seconds = estimate_active_seconds(
+        text, settings, protection_mask, pause_map, start_index, len(text)
+    )
+    spare_seconds = target_seconds - typing_seconds
+    count = plan_session_break_count(spare_seconds)
+    if count == 0:
+        return [], spare_seconds, typing_seconds
+    paragraph_starts, sentence_starts = find_session_break_candidates(text, protection_mask, start_index)
+    positions = choose_session_break_positions(
+        paragraph_starts, sentence_starts, count, start_index, len(text), rng
+    )
+    weights = make_session_break_weights(len(positions), rng)
+    breaks = [{"position": position, "weight": weight} for position, weight in zip(positions, weights)]
+    return breaks, spare_seconds, typing_seconds
+
+
+def compute_session_break_seconds(text, settings, protection_mask, pause_map, start_index, position,
+                                  target_seconds, elapsed_active, break_seconds_so_far,
+                                  this_weight, total_weight):
+    """Works out how long the break at `position` should last, from the time
+    that is actually left. `elapsed_active` is the time spent typing so far
+    (breaks and the person's own pauses left out). The pace so far is compared
+    with the estimate, so a slower or faster run changes the later breaks.
+    Returns 0.0 when the break should be skipped (running behind the target, or
+    the break would be too short to be worth it)."""
+    estimate_done = estimate_active_seconds(
+        text, settings, protection_mask, pause_map, start_index, position
+    )
+    estimate_left = estimate_active_seconds(
+        text, settings, protection_mask, pause_map, position, len(text)
+    )
+    if estimate_done >= SESSION_PACE_MIN_ESTIMATE_SECONDS:
+        pace = min(max(elapsed_active / estimate_done, 0.5), 3.0)
+    else:
+        pace = 1.0
+    predicted_left = estimate_left * pace
+    spare_seconds = target_seconds - elapsed_active - break_seconds_so_far - predicted_left
+    if spare_seconds <= 0 or total_weight <= 0:
+        return 0.0
+    seconds = spare_seconds * this_weight / total_weight
+    if seconds < SESSION_BREAK_MIN_SECONDS:
+        return 0.0
+    return min(seconds, SESSION_BREAK_MAX_SECONDS)
+
+
+# --------------------------------------------
+# DIFFICULTY-AWARE THINKING PAUSES (Update #33)
+# --------------------------------------------
+# Real people slow down on hard words and on long or packed sentences. Before
+# typing starts, the text is scanned once. A word earns "difficulty points"
+# for being long, having many syllables, holding digits, being an ALL-CAPS
+# acronym, or using rare letters. Common everyday words never count. A
+# sentence is "hard" when it is very long, holds several hard words, or is
+# packed with commas. The plan only says WHERE a pause may happen; the typing
+# loop draws the chance and the length when it gets there.
+DIFFICULTY_WORD_MIN_SCORE = 3       # points a word needs to count as hard
+DIFFICULTY_WORD_CHANCE = 0.7        # share of hard words that get a pause
+DIFFICULTY_WORD_GAP_WORDS = 4       # at least this many words between word pauses
+DIFFICULTY_WORD_SECONDS = (0.5, 1.5)
+DIFFICULTY_SENTENCE_CHANCE = 0.8    # share of hard sentences that get a pause
+DIFFICULTY_SENTENCE_SECONDS = (1.5, 3.5)
+DIFFICULTY_LONG_SENTENCE_WORDS = 30
+DIFFICULTY_DENSE_SENTENCE_HARD_WORDS = 3
+DIFFICULTY_COMMA_HEAVY_COUNT = 4
+DIFFICULTY_STRENGTH_MAX = 300.0
+
+DIFFICULTY_WORD_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\u2019\-]*")
+DIFFICULTY_VOWEL_GROUP_PATTERN = re.compile(r"[aeiouy]+")
+DIFFICULTY_SENTENCE_CLOSERS = "\"')]\u201d\u2019"
+
+# Long words that are still easy to think of and type. They never count as hard.
+DIFFICULTY_COMMON_WORDS = frozenset("""
+about above across actually after again against almost already although always
+among another anything around because become before behind being believe
+between beyond building business change children community company consider
+continue country different difficult discuss during education effect either
+enough environment especially everything example experience family following
+government great history however important include information interest
+itself knowledge language learning little looking material meeting message
+morning nothing number office opportunity others people percent perhaps person
+personal place political possible present president problem program public
+question reason receive remember research response result school second
+service should something sometimes started state student study support system
+taking thing think those though thought through together tomorrow towards
+understand university usually various water without wonder working world
+would write written yesterday
+""".split())
+
+
+def count_syllables(word):
+    """Rough syllable count: one per group of vowels, ignoring a silent final e."""
+    lowered = re.sub(r"[^a-z]", "", word.lower())
+    if not lowered:
+        return 0
+    count = len(DIFFICULTY_VOWEL_GROUP_PATTERN.findall(lowered))
+    if lowered.endswith("e") and not lowered.endswith(("le", "ee")) and count > 1:
+        count -= 1
+    return max(count, 1)
+
+
+def score_word_difficulty(word):
+    """Gives a word points for how hard it is to think of and type. Common
+    everyday words and very short words score 0."""
+    core = word.strip("-'\u2019")
+    letters = re.sub(r"[^A-Za-z]", "", core)
+    if len(core) < 4:
+        return 0
+    if core.lower() in DIFFICULTY_COMMON_WORDS:
+        return 0
+    points = 0
+    if len(letters) >= 12:
+        points += 2
+    elif len(letters) >= 8:
+        points += 1
+    syllables = count_syllables(letters)
+    if syllables >= 5:
+        points += 3
+    elif syllables >= 4:
+        points += 2
+    elif syllables >= 3:
+        points += 1
+    if any(ch.isdigit() for ch in core):
+        points += 2
+    if len(letters) >= 3 and letters.isupper():
+        points += 2  # an acronym such as NASA or HIPAA
+    if any(ch in "qxzjQXZJ" for ch in letters):
+        points += 1
+    return points
+
+
+def find_sentence_spans(text):
+    """Splits text into (start, end) sentence spans. A span starts at the first
+    character after a sentence end (or a paragraph break) and stops at the next
+    sentence end. A period after an abbreviation like "Dr." does not end one."""
+    spans = []
+    length = len(text)
+    start = 0
+    cursor = 0
+    while cursor < length:
+        char = text[cursor]
+        is_end = False
+        if char == "\n":
+            is_end = True
+        elif char in ".!?":
+            run_end = cursor
+            while run_end + 1 < length and text[run_end + 1] in ".!?":
+                run_end += 1
+            after = run_end + 1
+            while after < length and text[after] in DIFFICULTY_SENTENCE_CLOSERS:
+                after += 1
+            if after >= length or text[after].isspace():
+                token_start = cursor
+                while token_start > start and not text[token_start - 1].isspace():
+                    token_start -= 1
+                if _session_break_is_real_sentence_end(text[cursor:run_end + 1], text[token_start:cursor]):
+                    is_end = True
+                    cursor = after - 1
+        if is_end:
+            if text[start:cursor + 1].strip():
+                spans.append((start, cursor + 1))
+            start = cursor + 1
+        cursor += 1
+    if text[start:].strip():
+        spans.append((start, length))
+    return spans
+
+
+def plan_difficulty_pauses(text, protection_mask, start_index=0):
+    """Finds the spots where a hard word or a hard sentence earns a thinking
+    pause. Returns {index of the first character: (kind, weight)} where kind is
+    "word" or "sentence" and weight (1.0 and up) says how hard it is. Only text
+    from start_index on is planned. Protected text is never touched, and a
+    sentence pause wins over a word pause at the same spot."""
+    plan = {}
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        words = []
+        for match in DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end):
+            if any(protection_mask[match.start():match.end()]):
+                words.append((match.start(), 0))
+            else:
+                words.append((match.start(), score_word_difficulty(match.group())))
+        if not words:
+            continue
+
+        hard_count = sum(1 for _position, score in words if score >= DIFFICULTY_WORD_MIN_SCORE)
+        segment = text[span_start:span_end]
+        reasons = 0
+        if len(words) >= DIFFICULTY_LONG_SENTENCE_WORDS:
+            reasons += 1
+        if hard_count >= DIFFICULTY_DENSE_SENTENCE_HARD_WORDS:
+            reasons += 1
+        if sum(segment.count(mark) for mark in ",;:") >= DIFFICULTY_COMMA_HEAVY_COUNT:
+            reasons += 1
+        first_position = words[0][0]
+        if reasons and first_position >= start_index and not protection_mask[first_position]:
+            plan[first_position] = ("sentence", 1.0 + 0.25 * (reasons - 1))
+
+        # A word pause needs a few words of room after the last pause, and a
+        # sentence pause counts as the last pause for the sentence's first word.
+        words_since_pause = 0 if first_position in plan else DIFFICULTY_WORD_GAP_WORDS
+        for position, score in words:
+            words_since_pause += 1
+            if (position < start_index or position in plan
+                    or score < DIFFICULTY_WORD_MIN_SCORE
+                    or words_since_pause <= DIFFICULTY_WORD_GAP_WORDS):
+                continue
+            plan[position] = ("word", min(score / 3.0, 2.0))
+            words_since_pause = 0
+    return plan
+
+
+def draw_difficulty_pause_seconds(kind, weight, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with how hard the spot is and
+    with the Pause Strength setting."""
+    if kind == "sentence":
+        chance, (low, high) = DIFFICULTY_SENTENCE_CHANCE, DIFFICULTY_SENTENCE_SECONDS
+    else:
+        chance, (low, high) = DIFFICULTY_WORD_CHANCE, DIFFICULTY_WORD_SECONDS
+    if strength_percent <= 0 or random.random() >= chance:
+        return 0.0
+    return random.uniform(low, high) * weight * (strength_percent / 100.0)
+
+
+def estimate_difficulty_pause_seconds(text, protection_mask, settings):
+    """Average extra time the thinking pauses add to `text`. Uses the same
+    plan, chances, and ranges the typing loop draws from."""
+    if not settings.get("enable_difficulty_pauses", True):
+        return 0.0
+    strength = settings.get("difficulty_pause_strength", 100.0) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    total = 0.0
+    for kind, weight in plan_difficulty_pauses(text, mask).values():
+        if kind == "sentence":
+            average = sum(DIFFICULTY_SENTENCE_SECONDS) / 2.0
+            total += DIFFICULTY_SENTENCE_CHANCE * average * weight * strength
+        else:
+            average = sum(DIFFICULTY_WORD_SECONDS) / 2.0
+            total += DIFFICULTY_WORD_CHANCE * average * weight * strength
+    return total
+
+
+# --------------------------------------------
+# TYPING BURSTS AND PAUSES (Update #37)
+# --------------------------------------------
+# People rarely type a whole sentence in one go. They write a phrase, stop to
+# think, then write the next phrase. The bursts are longer when the wording is
+# familiar and shorter when the writer is choosing words or making an argument.
+# Before typing starts, each sentence is sorted as "familiar" or "wording".
+# A burst length (in words) is drawn for it, and a burst tries to end at a
+# comma, semicolon, or colon when one is close. The plan only says WHERE a short
+# pause may happen; the typing loop draws the chance and the length there.
+BURST_FAMILIAR = "familiar"
+BURST_WORDING = "wording"
+BURST_WORD_RANGES = {BURST_FAMILIAR: (8, 16), BURST_WORDING: (3, 7)}
+BURST_PAUSE_SECONDS = {BURST_FAMILIAR: (0.3, 0.9), BURST_WORDING: (0.5, 1.4)}
+BURST_PAUSE_CHANCE = 0.85           # share of burst ends that really pause
+BURST_CLAUSE_WINDOW_WORDS = 2       # end a burst early at a comma this close to its limit
+BURST_MIN_WORDS_AFTER = 3           # no burst pause with fewer words than this left in the sentence
+BURST_WORDING_COMMA_COUNT = 3       # this many commas, semicolons, or colons make a sentence "wording"
+BURST_CLAUSE_MARKS = ",;:"
+BURST_STRENGTH_MAX = 300.0
+
+# Words that usually show the writer is making a point or choosing a side.
+BURST_ARGUMENT_WORDS = frozenset("""
+because therefore however although though whereas thus hence moreover
+furthermore consequently unless despite instead rather arguably clearly
+but yet since should must cannot never always
+""".split())
+
+
+def classify_burst_sentence(words, segment):
+    """Returns BURST_WORDING when a sentence needs more thought (a hard word, an
+    argument word such as "because", or many commas), otherwise BURST_FAMILIAR.
+    `words` holds (start, end, score, protected, lowered) for each word."""
+    for _start, _end, score, protected, lowered in words:
+        if protected:
+            continue
+        if score >= DIFFICULTY_WORD_MIN_SCORE or lowered in BURST_ARGUMENT_WORDS:
+            return BURST_WORDING
+    if sum(segment.count(mark) for mark in BURST_CLAUSE_MARKS) >= BURST_WORDING_COMMA_COUNT:
+        return BURST_WORDING
+    return BURST_FAMILIAR
+
+
+def plan_typing_bursts(text, protection_mask, start_index=0, skip_positions=(), rng=None):
+    """Finds the spots where a burst of typing ends and a short pause may
+    happen. Returns {index of the first character of the next word: kind} where
+    kind is BURST_FAMILIAR or BURST_WORDING. Only text from start_index on is
+    planned. Nothing is planned at the first word of a sentence, in or next to
+    protected text, at a spot in skip_positions, or when fewer than
+    BURST_MIN_WORDS_AFTER words remain in the sentence. `rng` lets the time
+    estimate use a fixed random source so its answer does not wobble."""
+    rng = rng if rng is not None else random
+    plan = {}
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        words = []
+        for match in DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end):
+            protected = any(protection_mask[match.start():match.end()])
+            score = 0 if protected else score_word_difficulty(match.group())
+            words.append((match.start(), match.end(), score, protected, match.group().lower()))
+        if len(words) <= BURST_MIN_WORDS_AFTER:
+            continue
+
+        kind = classify_burst_sentence(words, text[span_start:span_end])
+        low, high = BURST_WORD_RANGES[kind]
+        burst_length = rng.randint(low, high)
+        words_in_burst = 0
+        for number in range(1, len(words)):
+            words_in_burst += 1  # the word before this one belongs to the current burst
+            if len(words) - number < BURST_MIN_WORDS_AFTER:
+                break
+            start = words[number][0]
+            previous_end = words[number - 1][1]
+            gap = text[previous_end:start]
+            ends_a_clause = any(mark in gap for mark in BURST_CLAUSE_MARKS)
+            limit_reached = words_in_burst >= burst_length
+            near_a_clause = ends_a_clause and words_in_burst >= max(low, burst_length - BURST_CLAUSE_WINDOW_WORDS)
+            if not (limit_reached or near_a_clause):
+                continue
+            # The burst ends here. Start counting the next one either way, so a
+            # skipped spot never makes the following bursts pile up.
+            words_in_burst = 0
+            burst_length = rng.randint(low, high)
+            if (words[number][3] or start < start_index or start in skip_positions
+                    or any(protection_mask[previous_end:start])):
+                continue
+            plan[start] = kind
+    return plan
+
+
+def draw_burst_pause_seconds(kind, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with the Pause Strength setting."""
+    if strength_percent <= 0 or random.random() >= BURST_PAUSE_CHANCE:
+        return 0.0
+    low, high = BURST_PAUSE_SECONDS[kind]
+    return random.uniform(low, high) * (strength_percent / 100.0)
+
+
+def estimate_burst_pause_seconds(text, protection_mask, settings):
+    """Average extra time the burst pauses add to `text`. Uses the same planner,
+    chance, and ranges the typing loop draws from, with a fixed random source so
+    the estimate stays steady from one click to the next."""
+    if not settings.get("enable_typing_bursts", True):
+        return 0.0
+    strength = settings.get("burst_pause_strength", 100.0) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    plan = plan_typing_bursts(text, mask, 0, (), random.Random(len(text)))
+    total = 0.0
+    for kind in plan.values():
+        average = sum(BURST_PAUSE_SECONDS[kind]) / 2.0
+        total += BURST_PAUSE_CHANCE * average * strength
+    return total
+
+
+# --------------------------------------------
+# PAUSES AT DECISION POINTS (Update #38)
+# --------------------------------------------
+# People stop longest where they have to decide something: what to say in a new
+# paragraph, how to put a claim, or which way to turn with a transition such as
+# "however". Hard words already get their own pause (Difficulty Pauses), so this
+# adds the other three. Before typing starts, the text is scanned once. The plan
+# only says WHERE a decision pause may happen; the typing loop draws the chance
+# and the length there.
+DECISION_PARAGRAPH = "paragraph"
+DECISION_CLAIM = "claim"
+DECISION_TRANSITION = "transition"
+DECISION_SECONDS = {
+    DECISION_PARAGRAPH: (1.0, 3.0),
+    DECISION_CLAIM: (1.0, 2.5),
+    DECISION_TRANSITION: (0.8, 2.0),
+}
+DECISION_CHANCE = {
+    DECISION_PARAGRAPH: 0.65,    # share of paragraph starts that really pause
+    DECISION_CLAIM: 0.6,
+    DECISION_TRANSITION: 0.7,
+}
+DECISION_COMBINED_WEIGHT = 1.25  # a paragraph that also opens with a claim or transition
+DECISION_PHRASE_MAX_WORDS = 4    # longest opening phrase that is checked
+DECISION_STRENGTH_MAX = 300.0
+# Characters that may sit between a line break and the first word of a paragraph
+# (spaces, an opening quote or bracket, a bullet mark).
+DECISION_LOOKBACK_CHARS = " \t\"'([\u201c\u2018-*#>"
+
+DECISION_TRANSITION_WORDS = frozenset("""
+however therefore moreover furthermore consequently nevertheless nonetheless
+meanwhile finally additionally similarly conversely otherwise overall
+ultimately thus hence instead accordingly
+""".split())
+
+DECISION_TRANSITION_PHRASES = frozenset([
+    "in addition", "for example", "for instance", "on the other hand",
+    "in contrast", "by contrast", "as a result", "in conclusion", "in summary",
+    "to summarize", "in other words", "in fact", "at the same time",
+    "on the contrary", "above all", "in particular", "to begin with",
+    "in the end", "even so", "that said",
+])
+
+DECISION_CLAIM_PHRASES = frozenset([
+    "i believe", "i argue", "i think", "i would argue", "i claim",
+    "in my opinion", "in my view", "this shows", "this proves", "this means",
+    "this suggests", "this demonstrates", "it is clear", "the evidence",
+    "the data", "the results", "studies show", "research shows",
+    "research suggests", "evidence shows", "clearly", "obviously", "undoubtedly",
+])
+
+
+def find_decision_phrase_kind(opening_words):
+    """Looks at the first few lowercase words of a sentence. Returns
+    DECISION_TRANSITION or DECISION_CLAIM when they open with a known transition
+    or claim phrase, otherwise None. The longest phrase is checked first."""
+    for count in range(min(len(opening_words), DECISION_PHRASE_MAX_WORDS), 0, -1):
+        phrase = " ".join(opening_words[:count])
+        if phrase in DECISION_TRANSITION_PHRASES:
+            return DECISION_TRANSITION
+        if count == 1 and phrase in DECISION_TRANSITION_WORDS:
+            return DECISION_TRANSITION
+        if phrase in DECISION_CLAIM_PHRASES:
+            return DECISION_CLAIM
+    return None
+
+
+def starts_new_paragraph(text, position):
+    """True when the word at `position` is the first word on its line and there
+    is real text before it (so the very first paragraph of the file is not one)."""
+    cursor = position
+    while cursor > 0 and text[cursor - 1] in DECISION_LOOKBACK_CHARS:
+        cursor -= 1
+    return cursor > 0 and text[cursor - 1] == "\n" and bool(text[:cursor].strip())
+
+
+def plan_decision_pauses(text, protection_mask, start_index=0, skip_positions=()):
+    """Finds the spots where a decision earns a pause: the first word of a new
+    paragraph, of a sentence that states a claim, or of a sentence that opens
+    with a transition (and a transition word right after a semicolon). Returns
+    {index of the first character: (kind, weight)}. Only text from start_index
+    on is planned. Nothing is planned in or next to protected text, at a spot in
+    skip_positions, or at the very start of the text. A claim or transition
+    spot is dropped when the sentence before it already got one."""
+    plan = {}
+    last_planned_sentence = -2
+    for sentence_number, (span_start, span_end) in enumerate(find_sentence_spans(text)):
+        if span_end <= start_index:
+            continue
+        words = list(DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end))
+        if not words:
+            continue
+
+        first = words[0]
+        position = first.start()
+        opening = [match.group().lower() for match in words[:DECISION_PHRASE_MAX_WORDS]]
+        kind = find_decision_phrase_kind(opening)
+        weight = 1.0
+        if starts_new_paragraph(text, position):
+            if kind is not None:
+                weight = DECISION_COMBINED_WEIGHT
+            kind = DECISION_PARAGRAPH
+        elif kind is not None and sentence_number - last_planned_sentence <= 1:
+            kind = None
+        if (kind is not None and position >= start_index and position not in skip_positions
+                and text[:position].strip()
+                and not any(protection_mask[max(0, position - 2):first.end()])):
+            plan[position] = (kind, weight)
+            last_planned_sentence = sentence_number
+
+        # A transition word right after a semicolon, such as "; however,"
+        for number in range(1, len(words)):
+            word = words[number]
+            if word.group().lower() not in DECISION_TRANSITION_WORDS:
+                continue
+            if ";" not in text[words[number - 1].end():word.start()]:
+                continue
+            spot = word.start()
+            if (spot < start_index or spot in skip_positions or spot in plan
+                    or any(protection_mask[words[number - 1].end():word.end()])):
+                continue
+            plan[spot] = (DECISION_TRANSITION, 1.0)
+            last_planned_sentence = sentence_number
+    return plan
+
+
+def draw_decision_pause_seconds(kind, weight, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with how strong the decision is
+    and with the Pause Strength setting."""
+    if strength_percent <= 0 or random.random() >= DECISION_CHANCE[kind]:
+        return 0.0
+    low, high = DECISION_SECONDS[kind]
+    return random.uniform(low, high) * weight * (strength_percent / 100.0)
+
+
+def estimate_decision_pause_seconds(text, protection_mask, settings):
+    """Average extra time the decision pauses add to `text`. Uses the same plan,
+    chances, and ranges the typing loop draws from."""
+    if not settings.get("enable_decision_pauses", True):
+        return 0.0
+    strength = settings.get("decision_pause_strength", 100.0) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    total = 0.0
+    for kind, weight in plan_decision_pauses(text, mask).values():
+        average = sum(DECISION_SECONDS[kind]) / 2.0
+        total += DECISION_CHANCE[kind] * average * weight * strength
+    return total
+
+
+# --------------------------------------------
+# WRITING HABITS (Update #41)
+# --------------------------------------------
+# A writer has habits. One always stops before opening a parenthesis, another
+# thinks hard before a quotation or a heading, another rushes through commas.
+# What makes them habits is that they stay the same all the way through the
+# text. Before typing starts, a habit profile is worked out from the text
+# itself (not from a fresh random draw), so the time estimate, the run, and a
+# resume all agree on it. For each kind of spot the typist is "none", "light",
+# or "strong", and the commas are typed "quick", "even", or "slow". Only the
+# length of a pause changes. The typed text never changes.
+HABIT_HEADING = "heading"
+HABIT_QUOTE = "quote"
+HABIT_ASIDE = "aside"
+HABIT_KINDS = (HABIT_HEADING, HABIT_QUOTE, HABIT_ASIDE)
+HABIT_SECONDS = {
+    HABIT_HEADING: (0.8, 2.0),
+    HABIT_QUOTE: (0.4, 1.2),
+    HABIT_ASIDE: (0.4, 1.2),
+}
+HABIT_STATUS = {
+    HABIT_HEADING: "Thinking about the heading...",
+    HABIT_QUOTE: "Thinking about a quotation...",
+    HABIT_ASIDE: "Deciding whether to add an aside...",
+}
+HABIT_CHANCE = {
+    "light": {HABIT_HEADING: 0.5, HABIT_QUOTE: 0.4, HABIT_ASIDE: 0.4},
+    "strong": {HABIT_HEADING: 0.9, HABIT_QUOTE: 0.8, HABIT_ASIDE: 0.8},
+}
+HABIT_LEVEL_CUTS = (0.3, 0.7)    # a roll under 0.3 is "none", under 0.7 "light", else "strong"
+HABIT_MIN_ACTIVE = 2             # at least this many of the three spot kinds are real habits
+HABIT_COMMA_PACE_CUTS = (0.3, 0.7)
+HABIT_COMMA_SCALE = {"quick": 0.5, "even": 1.0, "slow": 1.5}
+HABIT_COMMA_MIN_SCALE = 0.1
+HABIT_STRENGTH_MAX = 200.0
+HABIT_HEADING_MAX_CHARS = 80
+HABIT_HEADING_MAX_WORDS = 12
+HABIT_HEADING_END_MARKS = ".!?,;:"
+HABIT_BULLET_STARTS = ("- ", "* ", "+ ", "\u2022 ")
+HABIT_OPENING_BEFORE_QUOTE = "([{\u2014\u2013-"
+
+
+def get_writing_habit_profile(text):
+    """Works out this writer's habits from the text. The same text always gives
+    the same profile, so the estimate, the run, and a resume agree. Returns
+    {"heading": level, "quote": level, "aside": level, "comma": pace}."""
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    profile = {}
+    for kind in HABIT_KINDS:
+        roll = rng.random()
+        if roll < HABIT_LEVEL_CUTS[0]:
+            profile[kind] = "none"
+        elif roll < HABIT_LEVEL_CUTS[1]:
+            profile[kind] = "light"
+        else:
+            profile[kind] = "strong"
+    quiet = [kind for kind in HABIT_KINDS if profile[kind] == "none"]
+    while len(HABIT_KINDS) - len(quiet) < HABIT_MIN_ACTIVE:
+        profile[quiet.pop(rng.randrange(len(quiet)))] = "light"
+    roll = rng.random()
+    if roll < HABIT_COMMA_PACE_CUTS[0]:
+        profile["comma"] = "quick"
+    elif roll < HABIT_COMMA_PACE_CUTS[1]:
+        profile["comma"] = "even"
+    else:
+        profile["comma"] = "slow"
+    return profile
+
+
+def get_writing_habit_chances(profile):
+    """The chance that a planned spot really pauses, for each kind of spot.
+    A kind that is not a habit for this writer has a chance of 0."""
+    chances = {}
+    for kind in HABIT_KINDS:
+        chances[kind] = HABIT_CHANCE.get(profile.get(kind), {}).get(kind, 0.0)
+    return chances
+
+
+def get_comma_pace_scale(profile, strength_percent):
+    """How much longer or shorter than normal this writer lingers on a comma.
+    1.0 is the normal pause. The Habit Strength setting scales the difference."""
+    base = HABIT_COMMA_SCALE.get(profile.get("comma"), 1.0)
+    strength = max(0.0, min(float(strength_percent), HABIT_STRENGTH_MAX)) / 100.0
+    return max(HABIT_COMMA_MIN_SCALE, 1.0 + (base - 1.0) * strength)
+
+
+def describe_writing_habit_profile(profile):
+    """A short line for the session log. It names habits only, never any text."""
+    parts = [f"{kind} {profile.get(kind, 'none')}" for kind in HABIT_KINDS]
+    parts.append(f"commas {profile.get('comma', 'even')}")
+    return ", ".join(parts)
+
+
+def find_habit_heading_spots(text):
+    """Finds heading lines and the first line of text after each one. A heading
+    is a short line that is not a bullet and does not end like a sentence, with
+    blank lines around it, or a line that starts with #. Returns the index of the
+    first real character of each heading line and of each body line after it."""
+    lines = text.split("\n")
+    starts = []
+    position = 0
+    for line in lines:
+        starts.append(position)
+        position += len(line) + 1
+    spots = []
+    for number, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(HABIT_BULLET_STARTS):
+            continue
+        if not stripped.startswith("#"):
+            if (len(stripped) > HABIT_HEADING_MAX_CHARS
+                    or len(stripped.split()) > HABIT_HEADING_MAX_WORDS
+                    or stripped[-1] in HABIT_HEADING_END_MARKS):
+                continue
+            if number > 0 and lines[number - 1].strip():
+                continue
+            if number + 1 >= len(lines) or lines[number + 1].strip():
+                continue
+        body_number = number + 1
+        while body_number < len(lines) and not lines[body_number].strip():
+            body_number += 1
+        if body_number >= len(lines):
+            continue
+        body_line = lines[body_number]
+        spots.append(starts[number] + len(line) - len(line.lstrip()))
+        spots.append(starts[body_number] + len(body_line) - len(body_line.lstrip()))
+    return spots
+
+
+def plan_writing_habits(text, protection_mask, chances, start_index=0, skip_positions=()):
+    """Finds the spots where a habit may pause: a heading and the first line after
+    it, an opening quotation mark, and an opening parenthesis or a dash used as an
+    aside. Returns {index of the character it pauses before: kind}. Only kinds
+    with a chance above 0 are planned, and only text from start_index on. Nothing
+    is planned in or next to protected text, at a spot in skip_positions, or at
+    the very start of the text."""
+    plan = {}
+    length = len(text)
+    first_content = length - len(text.lstrip())
+
+    def add(spot, kind):
+        if chances.get(kind, 0.0) <= 0:
+            return
+        if spot <= first_content or spot < start_index or spot >= length:
+            return
+        if spot in plan or spot in skip_positions:
+            return
+        if any(protection_mask[max(0, spot - 2):spot + 1]):
+            return
+        plan[spot] = kind
+
+    for spot in find_habit_heading_spots(text):
+        add(spot, HABIT_HEADING)
+
+    for index, char in enumerate(text):
+        previous = text[index - 1] if index > 0 else "\n"
+        following = text[index + 1] if index + 1 < length else ""
+        if char == "\u201c":
+            if following and not following.isspace():
+                add(index, HABIT_QUOTE)
+        elif char == '"':
+            if (previous.isspace() or previous in HABIT_OPENING_BEFORE_QUOTE) \
+                    and following and not following.isspace():
+                add(index, HABIT_QUOTE)
+        elif char == "(":
+            if following and not following.isspace():
+                add(index, HABIT_ASIDE)
+        elif char == "\u2014":
+            add(index, HABIT_ASIDE)
+        elif char == "\u2013":
+            if previous == " " and following == " ":
+                add(index, HABIT_ASIDE)
+        elif char == "-":
+            if following == "-" and previous != "-":
+                add(index, HABIT_ASIDE)
+            elif previous == " " and following == " ":
+                line_start = text.rfind("\n", 0, index) + 1
+                if text[line_start:index].strip():    # not an indented bullet
+                    add(index, HABIT_ASIDE)
+    return plan
+
+
+def draw_writing_habit_seconds(kind, chance, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with the Habit Strength."""
+    if strength_percent <= 0 or chance <= 0 or random.random() >= chance:
+        return 0.0
+    low, high = HABIT_SECONDS[kind]
+    return random.uniform(low, high) * (strength_percent / 100.0)
+
+
+def summarize_writing_habit_plan(plan):
+    """Counts the planned spots per kind, for the session log."""
+    counts = {}
+    for kind in plan.values():
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def estimate_writing_habit_seconds(text, protection_mask, settings):
+    """Average extra time (or less time, for quick commas) the writing habits add
+    to `text`. Uses the same profile, plan, chances, and ranges as the typing
+    loop."""
+    if not settings.get("enable_writing_habits", True):
+        return 0.0
+    strength = settings.get("writing_habit_strength", 100.0)
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    profile = get_writing_habit_profile(text)
+    chances = get_writing_habit_chances(profile)
+    total = 0.0
+    for kind in plan_writing_habits(text, mask, chances).values():
+        total += chances[kind] * (sum(HABIT_SECONDS[kind]) / 2.0) * (strength / 100.0)
+    # A comma already pauses 0.5 to 1.5 seconds (1.0 on average). Quick or slow
+    # commas change that average.
+    total += text.count(",") * (get_comma_pace_scale(profile, strength) - 1.0)
+    return total
+
+
+# --------------------------------------------
+# UNEVEN RHYTHM (Update #40)
+# --------------------------------------------
+# A real typist does not keep one steady beat. Familiar phrases and everyday
+# words come out quickly. Names, technical terms, punctuation, and carefully
+# hedged claims ("this may suggest", "in some cases") slow the hands down.
+# Before typing starts, the text is scanned once and every character that
+# should type faster or slower is given a kind. Only the speed of a key
+# changes: nothing is added and no pause is made here (pauses belong to the
+# Difficulty, Burst, and Decision Pauses). The scan uses no randomness, so
+# the time estimate uses the very same plan.
+RHYTHM_FAST = "fast"
+RHYTHM_NAME = "name"
+RHYTHM_TECHNICAL = "technical"
+RHYTHM_HEDGE = "hedge"
+RHYTHM_PUNCTUATION = "punctuation"
+# Delay multipliers at 100% strength. Below 1.0 is quicker, above 1.0 slower.
+RHYTHM_BASE_MULTIPLIERS = {
+    RHYTHM_FAST: 0.85,         # a familiar word or phrase: 15% quicker
+    RHYTHM_NAME: 1.20,         # a name in the middle of a sentence: 20% slower
+    RHYTHM_TECHNICAL: 1.25,    # a hard word, an acronym, or a number: 25% slower
+    RHYTHM_HEDGE: 1.20,        # a hedging word or phrase: 20% slower
+    RHYTHM_PUNCTUATION: 1.30,  # a comma, colon, bracket, or quote mark: 30% slower
+}
+RHYTHM_MIN_MULTIPLIER = 0.5
+RHYTHM_STRENGTH_MAX = 200.0
+RHYTHM_PHRASE_MAX_WORDS = 4
+RHYTHM_PUNCTUATION_CHARS = frozenset(',;:()"?!\u201c\u201d\u2014\u2013')
+# A word right after one of these starts a quotation, so a capital letter
+# there is not a sign of a name.
+RHYTHM_OPENING_MARKS = "\"([\u201c\u2018"
+
+# Short everyday words that fly off the keys. Long everyday words come from
+# DIFFICULTY_COMMON_WORDS, which are added to this set below.
+RHYTHM_FAST_WORDS = frozenset("""
+the and of to in is it that was for on with as at by this be are from or an
+have not but they you we he she had has will would can all there their what
+when which were been your said each them then than into its out our more also
+just like some such only over very so if do did does has his her him how who
+why now one two any no yes up down about a i
+""".split()) | DIFFICULTY_COMMON_WORDS
+
+RHYTHM_FAST_PHRASES = frozenset([
+    "as well as", "a lot of", "one of the", "in order to", "a number of",
+    "going to", "such as", "kind of", "sort of", "a bit", "a few", "a little",
+    "of course", "so far", "at first", "in front of", "out of", "because of",
+    "according to", "as soon as", "as long as", "be able to", "able to",
+    "you know", "thank you", "for example", "for instance", "in addition",
+    "in fact", "at the end", "at the same time", "by the way", "right now",
+])
+
+# Words and phrases a writer uses to qualify a claim. Typing them carefully
+# is a sign of care, so they slow the rhythm down.
+RHYTHM_HEDGE_WORDS = frozenset("""
+may might could perhaps possibly probably likely unlikely generally typically
+usually often sometimes somewhat arguably apparently seemingly roughly
+approximately essentially largely mostly partly partially relatively fairly
+rarely occasionally potentially presumably supposedly conceivably
+""".split())
+
+RHYTHM_HEDGE_PHRASES = frozenset([
+    "tends to", "tend to", "tended to", "in some cases", "in many cases",
+    "in most cases", "to some extent", "to a degree", "to a certain extent",
+    "it seems", "it appears", "seems to", "appears to", "not necessarily",
+    "more or less", "in general", "for the most part", "as far as",
+    "can be argued", "it is possible", "it is likely", "it is unlikely",
+    "at least in part", "in part", "on the whole", "so to speak",
+])
+
+
+def clamp_rhythm_strength(strength_percent):
+    """Returns the rhythm strength as a float between 0 and RHYTHM_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), RHYTHM_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_rhythm_multiplier(kind, strength_percent):
+    """Returns the delay multiplier for one kind of rhythm change at the given
+    strength (never below RHYTHM_MIN_MULTIPLIER). 1.0 means no change."""
+    base = RHYTHM_BASE_MULTIPLIERS.get(kind, 1.0)
+    strength = clamp_rhythm_strength(strength_percent) / 100.0
+    return max(RHYTHM_MIN_MULTIPLIER, 1.0 + (base - 1.0) * strength)
+
+
+def classify_rhythm_word(word, starts_sentence):
+    """Sorts one word into a rhythm kind, or None when it keeps the normal
+    speed. A hedging word wins over everything, then numbers, hard words and
+    acronyms, then everyday words, and last a name in the middle of a sentence
+    (a capital letter at the start of a sentence says nothing about a name)."""
+    core = word.strip("-'\u2019")
+    if not core:
+        return None
+    lowered = core.lower()
+    if lowered in RHYTHM_HEDGE_WORDS:
+        return RHYTHM_HEDGE
+    if any(ch.isdigit() for ch in core):
+        return RHYTHM_TECHNICAL
+    if score_word_difficulty(core) >= DIFFICULTY_WORD_MIN_SCORE:
+        return RHYTHM_TECHNICAL
+    if len(core) >= 2 and core.isupper() and core.isalpha():
+        return RHYTHM_TECHNICAL  # an acronym such as NASA
+    if core[0] == "I" and len(core) > 1 and core[1] in "'\u2019":
+        return RHYTHM_FAST  # I'm, I'll, I've
+    if lowered in RHYTHM_FAST_WORDS:
+        return RHYTHM_FAST
+    if not starts_sentence and len(core) >= 2 and core[0].isupper():
+        return RHYTHM_NAME
+    return None
+
+
+def find_rhythm_phrase_spans(text, words, phrases):
+    """Finds runs of neighbouring words (only spaces between them) that make a
+    phrase from `phrases`. Returns (start, end) character spans in `text`. The
+    longest phrase at each spot is taken."""
+    spans = []
+    number = 0
+    while number < len(words):
+        matched_size = 0
+        for size in range(min(RHYTHM_PHRASE_MAX_WORDS, len(words) - number), 1, -1):
+            group = words[number:number + size]
+            joined_by_spaces = all(
+                not text[group[k].end():group[k + 1].start()].strip()
+                and "\n" not in text[group[k].end():group[k + 1].start()]
+                for k in range(size - 1)
+            )
+            if not joined_by_spaces:
+                continue
+            phrase = " ".join(match.group().lower() for match in group)
+            if phrase in phrases:
+                spans.append((group[0].start(), group[-1].end()))
+                matched_size = size
+                break
+        number += matched_size if matched_size else 1
+    return spans
+
+
+def _mark_rhythm_span(kinds, start, end, kind, protection_mask, start_index, overwrite):
+    """Gives each character in [start, end) the rhythm kind. Protected text and
+    text before start_index are left alone. With overwrite False, a character
+    that already has a kind keeps it."""
+    for index in range(max(start, start_index), end):
+        if protection_mask[index]:
+            continue
+        if overwrite or index not in kinds:
+            kinds[index] = kind
+
+
+def plan_uneven_rhythm(text, protection_mask, start_index=0):
+    """Scans the text once and returns {character index: rhythm kind} for every
+    character that should type faster or slower than normal. Only text from
+    start_index on is planned, and protected text is never touched. No
+    randomness is used, so the same text always gives the same plan."""
+    kinds = {}
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        words = list(DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end))
+        # Step 1: single words (everyday, hard, number, acronym, name, hedge)
+        for number, match in enumerate(words):
+            starts_sentence = number == 0 or text[match.start() - 1] in RHYTHM_OPENING_MARKS
+            kind = classify_rhythm_word(match.group(), starts_sentence)
+            if kind is not None:
+                _mark_rhythm_span(kinds, match.start(), match.end(), kind,
+                                  protection_mask, start_index, True)
+        # Step 2: familiar phrases only fill in what is still unmarked
+        for phrase_start, phrase_end in find_rhythm_phrase_spans(text, words, RHYTHM_FAST_PHRASES):
+            _mark_rhythm_span(kinds, phrase_start, phrase_end, RHYTHM_FAST,
+                              protection_mask, start_index, False)
+        # Step 3: hedging phrases win over everything else
+        for phrase_start, phrase_end in find_rhythm_phrase_spans(text, words, RHYTHM_HEDGE_PHRASES):
+            _mark_rhythm_span(kinds, phrase_start, phrase_end, RHYTHM_HEDGE,
+                              protection_mask, start_index, True)
+    # Step 4: punctuation keys
+    for index in range(max(0, start_index), len(text)):
+        if text[index] in RHYTHM_PUNCTUATION_CHARS and not protection_mask[index]:
+            kinds[index] = RHYTHM_PUNCTUATION
+    return kinds
+
+
+def summarize_rhythm_plan(plan):
+    """Counts how many characters each rhythm kind covers, for the session log.
+    Only counts are returned, never any of the text."""
+    counts = {}
+    for kind in plan.values():
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def estimate_rhythm_shift(text, protection_mask, settings):
+    """Adds up how much the uneven rhythm changes the typing time of `text`,
+    counted in average per-character delays (negative means faster). Uses the
+    same plan the typing loop uses."""
+    if not settings.get("enable_uneven_rhythm", True):
+        return 0.0
+    strength = clamp_rhythm_strength(settings.get("rhythm_strength", 100.0))
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    plan = plan_uneven_rhythm(text, mask)
+    return sum(get_rhythm_multiplier(kind, strength) - 1.0 for kind in plan.values())
+
+
+# --------------------------------------------
+# ESSAY PACE (Update #42)
+# --------------------------------------------
+# A writer does not keep one pace from the first line to the last. The opening
+# takes planning, so it is typed a little slower and stops now and then. Once
+# the argument is set, the body speeds up. The closing slows down again while
+# the writer decides how to end. The zones come from where a character sits in
+# the whole file (first 15% opening, last 15% closing). Speed eases between
+# zones. The pace uses no randomness, so the time estimate uses the same plan.
+# Short files have no real opening or closing, so they are left alone.
+ESSAY_OPENING = "opening"
+ESSAY_CLOSING = "closing"
+ESSAY_MIN_CHARS = 1200
+ESSAY_OPENING_END = 0.15      # the opening is the first 15% of the file
+ESSAY_EASE_IN_END = 0.30      # the body pace is fully reached here
+ESSAY_EASE_OUT_START = 0.75   # slowing toward the closing starts here
+ESSAY_CLOSING_START = 0.85    # the closing is the last 15% of the file
+# Delay multipliers at 100% strength. Above 1.0 is slower, below 1.0 quicker.
+ESSAY_OPENING_SPEED = 1.10
+ESSAY_BODY_SPEED = 0.92
+ESSAY_CLOSING_SPEED = 1.12
+ESSAY_MIN_MULTIPLIER = 0.5
+ESSAY_STRENGTH_MAX = 200.0
+ESSAY_PAUSE_CHANCE = {ESSAY_OPENING: 0.35, ESSAY_CLOSING: 0.40}
+ESSAY_PAUSE_SECONDS = {ESSAY_OPENING: (0.8, 2.2), ESSAY_CLOSING: (1.0, 2.8)}
+ESSAY_STATUS = {
+    ESSAY_OPENING: "Planning the opening...",
+    ESSAY_CLOSING: "Deciding how to end...",
+}
+
+
+def clamp_essay_strength(strength_percent):
+    """Returns the essay pace strength as a float between 0 and ESSAY_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), ESSAY_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_essay_zone(fraction):
+    """Returns ESSAY_OPENING, ESSAY_CLOSING, or None (the body) for a place in
+    the file given as a fraction from 0 to 1."""
+    if fraction < ESSAY_OPENING_END:
+        return ESSAY_OPENING
+    if fraction >= ESSAY_CLOSING_START:
+        return ESSAY_CLOSING
+    return None
+
+
+def get_essay_base_speed(fraction):
+    """The delay multiplier at 100% strength for a place in the file. It eases
+    from the opening pace to the body pace, and from the body pace to the
+    closing pace, so the speed never jumps."""
+    if fraction < ESSAY_OPENING_END:
+        return ESSAY_OPENING_SPEED
+    if fraction < ESSAY_EASE_IN_END:
+        progress = (fraction - ESSAY_OPENING_END) / (ESSAY_EASE_IN_END - ESSAY_OPENING_END)
+        return ESSAY_OPENING_SPEED + (ESSAY_BODY_SPEED - ESSAY_OPENING_SPEED) * progress
+    if fraction < ESSAY_EASE_OUT_START:
+        return ESSAY_BODY_SPEED
+    if fraction < ESSAY_CLOSING_START:
+        progress = (fraction - ESSAY_EASE_OUT_START) / (ESSAY_CLOSING_START - ESSAY_EASE_OUT_START)
+        return ESSAY_BODY_SPEED + (ESSAY_CLOSING_SPEED - ESSAY_BODY_SPEED) * progress
+    return ESSAY_CLOSING_SPEED
+
+
+def get_essay_pace_multiplier(position, total_length, strength_percent):
+    """Returns the delay multiplier for the character at `position` in a file of
+    `total_length` characters (never below ESSAY_MIN_MULTIPLIER). 1.0 means no
+    change, which is also the answer for a file shorter than ESSAY_MIN_CHARS."""
+    if total_length < ESSAY_MIN_CHARS:
+        return 1.0
+    fraction = max(0.0, min(position / total_length, 1.0))
+    strength = clamp_essay_strength(strength_percent) / 100.0
+    base = get_essay_base_speed(fraction)
+    return max(ESSAY_MIN_MULTIPLIER, 1.0 + (base - 1.0) * strength)
+
+
+def plan_essay_pauses(text, protection_mask, start_index=0, skip_positions=(), offset=0, total=None):
+    """Finds the sentence starts in the opening and the closing where the writer
+    may stop to plan. Returns {index of the first character: zone}. Only text
+    from start_index on is planned. Nothing is planned in or next to protected
+    text, at a spot in skip_positions, or at the very start of the file.
+    `offset` and `total` say where `text` sits inside the whole file, for
+    estimates on a stretch of it (the typing loop leaves them alone)."""
+    plan = {}
+    if total is None:
+        total = len(text)
+    if total < ESSAY_MIN_CHARS:
+        return plan
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        first = DIFFICULTY_WORD_PATTERN.search(text, span_start, span_end)
+        if first is None:
+            continue
+        position = first.start()
+        zone = get_essay_zone((offset + position) / total)
+        if zone is None or position < start_index or position in skip_positions:
+            continue
+        if offset == 0 and not text[:position].strip():
+            continue
+        if any(protection_mask[max(0, position - 2):first.end()]):
+            continue
+        plan[position] = zone
+    return plan
+
+
+def draw_essay_pause_seconds(zone, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with the Pace Strength."""
+    if strength_percent <= 0 or random.random() >= ESSAY_PAUSE_CHANCE[zone]:
+        return 0.0
+    low, high = ESSAY_PAUSE_SECONDS[zone]
+    return random.uniform(low, high) * (strength_percent / 100.0)
+
+
+def summarize_essay_pause_plan(plan):
+    """Counts the planned spots per zone, for the session log."""
+    counts = {}
+    for zone in plan.values():
+        counts[zone] = counts.get(zone, 0) + 1
+    return counts
+
+
+def estimate_essay_pace_shift(text, protection_mask, settings, offset=0, total=None):
+    """Adds up how much the essay pace changes the typing time of `text`,
+    counted in average per-character delays (negative means faster). Uses the
+    same multipliers the typing loop uses."""
+    if not settings.get("enable_essay_pace", True):
+        return 0.0
+    strength = clamp_essay_strength(settings.get("essay_pace_strength", 100.0))
+    if strength <= 0:
+        return 0.0
+    if total is None:
+        total = len(text)
+    if total < ESSAY_MIN_CHARS:
+        return 0.0
+    shift = 0.0
+    for index in range(len(text)):
+        if protection_mask is not None and protection_mask[index]:
+            continue
+        shift += get_essay_pace_multiplier(offset + index, total, strength) - 1.0
+    return shift
+
+
+def estimate_essay_pause_seconds(text, protection_mask, settings, offset=0, total=None):
+    """Average extra time the opening and closing pauses add to `text`. Uses
+    the same plan, chances, and ranges the typing loop draws from."""
+    if not settings.get("enable_essay_pace", True):
+        return 0.0
+    strength = clamp_essay_strength(settings.get("essay_pace_strength", 100.0)) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    total_seconds = 0.0
+    for zone in plan_essay_pauses(text, mask, 0, (), offset, total).values():
+        total_seconds += ESSAY_PAUSE_CHANCE[zone] * (sum(ESSAY_PAUSE_SECONDS[zone]) / 2.0) * strength
+    return total_seconds
+
+
+# --------------------------------------------
+# WARM-UP AFTER BREAKS (Update #45)
+# --------------------------------------------
+# A typist does not come back from a break at full speed. After a research
+# break, a long session break, a long pause marker, or any other long wait, the
+# first characters are typed a little slower and the speed eases back to normal.
+# Only speed changes here, so no pauses are added and the typed text never
+# changes. Protected text always types at the normal speed.
+WARMUP_LONG_PAUSE_SECONDS = 8.0   # a wait this long (or longer) starts a warm-up
+WARMUP_CHARS = 20                 # how many characters the warm-up lasts
+WARMUP_SLOWDOWN = 0.30            # at 100% strength the first key is 30% slower
+WARMUP_STRENGTH_MAX = 200.0
+
+
+def clamp_warmup_strength(strength_percent):
+    """Returns the warm-up strength as a float between 0 and WARMUP_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), WARMUP_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_warmup_multiplier(chars_done, strength_percent):
+    """Returns the delay multiplier for a key typed `chars_done` characters after
+    a long break. The first key is the slowest, and the slowdown shrinks in
+    even steps to 1.0 (no change) at WARMUP_CHARS characters."""
+    if chars_done >= WARMUP_CHARS:
+        return 1.0
+    strength = clamp_warmup_strength(strength_percent) / 100.0
+    remaining = (WARMUP_CHARS - max(0, chars_done)) / WARMUP_CHARS
+    return 1.0 + WARMUP_SLOWDOWN * strength * remaining
+
+
+class TypingWarmUp:
+    """Tracks whether the typist is warming up after a long wait and gives a
+    delay multiplier per key."""
+
+    def __init__(self, strength_percent):
+        self.strength = clamp_warmup_strength(strength_percent)
+        self.chars_done = WARMUP_CHARS  # not warming up until a long wait happens
+
+    def note_wait(self, seconds):
+        """Call after any wait. A wait of WARMUP_LONG_PAUSE_SECONDS or more starts
+        a warm-up (or restarts one). Returns True when a warm-up started."""
+        try:
+            long_enough = float(seconds) >= WARMUP_LONG_PAUSE_SECONDS
+        except (ValueError, TypeError):
+            return False
+        if long_enough:
+            self.chars_done = 0
+        return long_enough
+
+    def step(self):
+        """Call once per typed character. Returns the delay multiplier."""
+        multiplier = get_warmup_multiplier(self.chars_done, self.strength)
+        if self.chars_done < WARMUP_CHARS:
+            self.chars_done += 1
+        return multiplier
+
+
+def get_long_pause_share(low, high):
+    """Returns the share (0 to 1) of a pause range, drawn evenly between low and
+    high seconds, that is long enough to start a warm-up."""
+    try:
+        low = float(low)
+        high = float(high)
+    except (ValueError, TypeError):
+        return 0.0
+    if high < low:
+        low, high = high, low
+    if high < WARMUP_LONG_PAUSE_SECONDS:
+        return 0.0
+    if low >= WARMUP_LONG_PAUSE_SECONDS or high == low:
+        return 1.0
+    return (high - WARMUP_LONG_PAUSE_SECONDS) / (high - low)
+
+
+def estimate_warmup_seconds(text, settings, avg_delay):
+    """Average extra time the warm-up adds to `text`. It counts the waits that
+    can be averaged: research breaks, paragraph pauses, and sentence pauses
+    whose range reaches WARMUP_LONG_PAUSE_SECONDS. Session breaks and
+    {{pause:N}} markers are not counted, since they are not averages."""
+    if not settings.get("enable_warmup", True):
+        return 0.0
+    strength = clamp_warmup_strength(settings.get("warmup_strength", 100.0)) / 100.0
+    if strength <= 0:
+        return 0.0
+    events = 0.0
+    newline_count = text.count("\n")
+    events += newline_count * get_long_pause_share(
+        settings.get("paragraph_pause_min", 0), settings.get("paragraph_pause_max", 0)
+    )
+    sentence_ender_count = sum(text.count(c) for c in [".", "!", "?"])
+    events += sentence_ender_count * get_long_pause_share(
+        settings.get("sentence_pause_min", 0), settings.get("sentence_pause_max", 0)
+    )
+    break_min = settings.get("break_min", 0)
+    break_max = settings.get("break_max", 0)
+    if settings.get("enable_breaks") and break_min and break_max:
+        avg_break_interval = (break_min + break_max) / 2
+        if avg_break_interval > 0:
+            events += (newline_count / avg_break_interval) * get_long_pause_share(
+                settings.get("break_duration_min", 0), settings.get("break_duration_max", 0)
+            )
+    # Each warm-up adds a slowdown that starts at WARMUP_SLOWDOWN * strength on
+    # the first key and shrinks in even steps to nothing over WARMUP_CHARS keys.
+    # Added up, that is (WARMUP_CHARS + 1) / 2 times WARMUP_SLOWDOWN * strength
+    # average delays per warm-up.
+    extra_delays = WARMUP_SLOWDOWN * strength * (WARMUP_CHARS + 1) / 2.0
+    return events * extra_delays * avg_delay
+
+
+# --------------------------------------------
+# FATIGUE DRIFT
+# --------------------------------------------
+def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000):
+    """Calculates a delay multiplier representing human fatigue.
+
+    As characters are typed without a break, the multiplier gently ramps
+    from 1.0 (normal delay) up to (1.0 + fatigue_strength / 100.0).
+    After a research break, chars_since_break drops back toward normal to
+    simulate recovery.
+
+    Args:
+        chars_since_break (int or float): Number of characters typed since
+            session start or last break recovery.
+        fatigue_strength (float): Maximum slowdown percentage (e.g. 15 for 15%).
+            Safe range is clamped between 0 and 40.
+        ramp_chars (int): Character count over which maximum fatigue develops.
+            Defaults to 2000 characters.
+
+    Returns:
+        float: Multiplier >= 1.0 to scale per-key delays. Never negative or extreme.
+    """
+    try:
+        strength = max(0.0, min(float(fatigue_strength), 40.0))
+    except (ValueError, TypeError):
+        strength = 0.0
+
+    try:
+        chars = max(0.0, float(chars_since_break))
+    except (ValueError, TypeError):
+        chars = 0.0
+
+    ramp = max(1.0, float(ramp_chars))
+    progress = min(chars / ramp, 1.0)
+    multiplier = 1.0 + (strength / 100.0) * progress
+    # Clamp safely to ensure delays are never negative or extreme
+    return max(1.0, min(multiplier, 1.0 + (strength / 100.0)))
+
+
+# --------------------------------------------
+# FLOW AND HESITATION STATES (Update #31)
+# --------------------------------------------
+# Fatigue drift only slows the typist down over time. Real typing also has
+# moods: a stretch where the words are coming easily (flow) and a stretch of
+# second-guessing (hesitation). The typist moves between three states:
+#   normal -> flow or hesitant -> normal -> ...
+# Each state lasts a random number of characters. The speed changes ease in
+# over a few characters so it never jumps. Only speed changes here.
+MOOD_NORMAL = "normal"
+MOOD_FLOW = "flow"
+MOOD_HESITANT = "hesitant"
+MOOD_LENGTH_CHARS = {
+    MOOD_NORMAL: (100, 300),
+    MOOD_FLOW: (80, 270),
+    MOOD_HESITANT: (40, 150),
+}
+MOOD_FLOW_CHANCE = 0.55         # chance that the next mood after normal is flow
+MOOD_FLOW_SPEEDUP = 0.15        # at 100% strength, flow is 15% quicker
+MOOD_HESITANT_SLOWDOWN = 0.25   # at 100% strength, hesitation is 25% slower
+MOOD_EASE_CHARS = 12            # characters it takes to ease into a new speed
+MOOD_STRENGTH_MAX = 200.0
+
+
+def clamp_mood_strength(strength_percent):
+    """Returns the mood strength as a float between 0 and MOOD_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), MOOD_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_mood_target_multiplier(mood, strength_percent):
+    """Returns the delay multiplier a mood is heading toward (never below 0.5)."""
+    strength = clamp_mood_strength(strength_percent) / 100.0
+    if mood == MOOD_FLOW:
+        return max(0.5, 1.0 - MOOD_FLOW_SPEEDUP * strength)
+    if mood == MOOD_HESITANT:
+        return 1.0 + MOOD_HESITANT_SLOWDOWN * strength
+    return 1.0
+
+
+def estimate_mood_multiplier(strength_percent):
+    """Average delay multiplier over a long run, for the pre-start estimate.
+
+    One cycle is a normal stretch followed by either a flow stretch or a
+    hesitant stretch, each weighted by its average length in characters.
+    """
+    def average_length(mood):
+        low, high = MOOD_LENGTH_CHARS[mood]
+        return (low + high) / 2.0
+
+    flow_chars = MOOD_FLOW_CHANCE * average_length(MOOD_FLOW)
+    hesitant_chars = (1.0 - MOOD_FLOW_CHANCE) * average_length(MOOD_HESITANT)
+    normal_chars = average_length(MOOD_NORMAL)
+    total_chars = normal_chars + flow_chars + hesitant_chars
+    weighted = (
+        normal_chars * get_mood_target_multiplier(MOOD_NORMAL, strength_percent)
+        + flow_chars * get_mood_target_multiplier(MOOD_FLOW, strength_percent)
+        + hesitant_chars * get_mood_target_multiplier(MOOD_HESITANT, strength_percent)
+    )
+    return weighted / total_chars
+
+
+class TypingMood:
+    """Tracks the typist's current mood and gives a delay multiplier per key."""
+
+    def __init__(self, strength_percent):
+        self.strength = clamp_mood_strength(strength_percent)
+        self.mood = MOOD_NORMAL
+        self.multiplier = 1.0
+        self.chars_left = self._draw_length(MOOD_NORMAL)
+
+    @staticmethod
+    def _draw_length(mood):
+        low, high = MOOD_LENGTH_CHARS[mood]
+        return random.randint(low, high)
+
+    def reset(self):
+        """A long rest puts the typist back in the normal state right away."""
+        self.mood = MOOD_NORMAL
+        self.multiplier = 1.0
+        self.chars_left = self._draw_length(MOOD_NORMAL)
+
+    def step(self):
+        """Call once per typed character.
+
+        Returns (multiplier, new_mood). new_mood is the name of the mood that
+        just started, or None when the mood did not change on this character.
+        """
+        new_mood = None
+        self.chars_left -= 1
+        if self.chars_left <= 0:
+            if self.mood == MOOD_NORMAL:
+                self.mood = MOOD_FLOW if random.random() < MOOD_FLOW_CHANCE else MOOD_HESITANT
+            else:
+                self.mood = MOOD_NORMAL
+            self.chars_left = self._draw_length(self.mood)
+            new_mood = self.mood
+        target = get_mood_target_multiplier(self.mood, self.strength)
+        self.multiplier += (target - self.multiplier) / MOOD_EASE_CHARS
+        return self.multiplier, new_mood
+
+
+# --------------------------------------------
+# TYPO SIMULATION HELPERS
+# --------------------------------------------
+# Update #44: about 1 in 5 typos is a capital letter slip when the letter allows it.
+CAPITAL_SLIP_SHARE = 0.2
+
+
+def _capital_slip_possible(text, idx, protection_mask):
+    """True when text[idx] can come out as a wrong capital (like the H in
+    "tHe"): a plain a to z letter in the middle of a word, never the first
+    letter, and never next to protected text."""
+    char = text[idx]
+    if not ("a" <= char <= "z"):
+        return False
+    if idx == 0 or not text[idx - 1].isalpha():
+        return False
+    return not protection_mask[idx - 1]
+
+
+def _simulate_capital_slip_typo(settings, char, text, idx, protection_mask, use_extra_typos):
+    """Simulates a capital letter slip (Update #44): the letter comes out as a
+    capital, the typist notices, backspaces it, and the caller then types the
+    correct lowercase letter. Timing matches the adjacent-key typo."""
+    _simulate_adjacent_key_typo(
+        settings, char, text, idx, protection_mask, use_extra_typos, capital_slip=True
+    )
+
+
+def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_extra_typos,
+                                capital_slip=False):
+    """Simulates an adjacent-key typo on a QWERTY keyboard.
+    When use_extra_typos is False, preserves the original quick wrong-and-backspace behavior.
+    When use_extra_typos is True, types 1-3 lookahead characters before pausing and backspacing.
+    When capital_slip is True, the wrong character is the same letter as a capital
+    instead of a neighboring key (Update #44)."""
+    if capital_slip:
+        wrong_char = char.upper()
+        slip_name = "capital slip"
+    else:
+        wrong_char = random.choice(QWERTY_ADJACENCY[char.lower()])
+        slip_name = "adjacent-key"
+        if char.isupper():
+            wrong_char = wrong_char.upper()
+
+    if not use_extra_typos:
+        _send_char(settings, wrong_char)
+        paced_sleep(random.uniform(0.08, 0.25))
+        _send_backspace(settings)
+        paced_sleep(random.uniform(0.05, 0.15))
+        if capital_slip:
+            log_event("typo", f"capital slip: typed '{wrong_char}' instead of '{char}'")
+        else:
+            log_event("typo", f"typed '{wrong_char}' instead of '{char}'")
+        return
+
+    # Extra typos enabled: delayed notice with 1-3 lookahead characters
+    lookahead = []
+    max_k = min(3, len(text) - (idx + 1))
+    for offset in range(1, max_k + 1):
+        pos = idx + offset
+        if protection_mask[pos] or text[pos] == "\n":
+            break
+        lookahead.append(text[pos])
+
+    k = random.randint(1, len(lookahead)) if lookahead else 0
+    lookahead_str = "".join(lookahead[:k])
+
+    _send_char(settings, wrong_char)
+    paced_sleep(random.uniform(0.06, 0.15))
+    for lc in lookahead_str:
+        _send_char(settings, lc)
+        paced_sleep(random.uniform(0.06, 0.15))
+
+    # Delayed notice hesitation
+    paced_sleep(random.uniform(0.25, 0.55))
+
+    # Backspace lookahead + wrong_char (always finishes, even if Stop is pressed,
+    # so no wrong letters are ever left on screen)
+    for _ in range(len(lookahead_str) + 1):
+        _send_backspace(settings)
+        paced_sleep(random.uniform(0.05, 0.12))
+
+    paced_sleep(random.uniform(0.08, 0.18))
+    log_event("typo", f"{slip_name}: typed '{wrong_char}{lookahead_str}', backspaced to retype '{char}'")
+
+
+def _simulate_swapped_letter_typo(settings, text, idx, protection_mask):
+    """Simulates swapped adjacent letters inside a word (e.g. 'teh' for 'the').
+    Types c2 then c1, followed by 1-3 lookahead characters, pauses, then backspaces
+    all of them so the caller loop can retype the characters in correct order."""
+    c1 = text[idx]
+    c2 = text[idx + 1]
+
+    lookahead = []
+    max_k = min(3, len(text) - (idx + 2))
+    for offset in range(1, max_k + 1):
+        pos = idx + 1 + offset
+        if protection_mask[pos] or text[pos] == "\n":
+            break
+        lookahead.append(text[pos])
+
+    k = random.randint(1, len(lookahead)) if lookahead else 0
+    lookahead_str = "".join(lookahead[:k])
+
+    _send_char(settings, c2)
+    paced_sleep(random.uniform(0.06, 0.15))
+    _send_char(settings, c1)
+    paced_sleep(random.uniform(0.06, 0.15))
+    for lc in lookahead_str:
+        _send_char(settings, lc)
+        paced_sleep(random.uniform(0.06, 0.15))
+
+    # Delayed notice hesitation
+    paced_sleep(random.uniform(0.25, 0.55))
+
+    # Backspace lookahead + both swapped letters (always finishes, even if Stop
+    # is pressed, so no wrong letters are ever left on screen)
+    for _ in range(len(lookahead_str) + 2):
+        _send_backspace(settings)
+        paced_sleep(random.uniform(0.05, 0.12))
+
+    paced_sleep(random.uniform(0.08, 0.18))
+    log_event("typo", f"swapped letters: typed '{c2}{c1}{lookahead_str}', backspaced to retype '{c1}{c2}'")
+
+
+def _simulate_doubled_letter_typo(settings, text, idx, protection_mask):
+    """Simulates an accidental doubled letter ('ttthe' style repeat).
+    Types the letter twice, follows with 0-3 lookahead characters, pauses,
+    and backspaces the lookahead characters plus the single extra duplicate letter.
+    Leaves the original intended letter on screen and returns True so caller
+    knows not to type char a second time."""
+    char = text[idx]
+
+    lookahead = []
+    max_k = min(3, len(text) - (idx + 1))
+    for offset in range(1, max_k + 1):
+        pos = idx + offset
+        if protection_mask[pos] or text[pos] == "\n":
+            break
+        lookahead.append(text[pos])
+
+    k = random.randint(0, len(lookahead)) if lookahead else 0
+    lookahead_str = "".join(lookahead[:k])
+
+    _send_char(settings, char)
+    paced_sleep(random.uniform(0.04, 0.10))
+    _send_char(settings, char)
+    paced_sleep(random.uniform(0.06, 0.15))
+    for lc in lookahead_str:
+        _send_char(settings, lc)
+        paced_sleep(random.uniform(0.06, 0.15))
+
+    # Delayed notice hesitation
+    paced_sleep(random.uniform(0.20, 0.50))
+
+    # Backspace lookahead + single extra duplicate letter (always finishes, even
+    # if Stop is pressed, so no extra letters are ever left on screen)
+    for _ in range(len(lookahead_str) + 1):
+        _send_backspace(settings)
+        paced_sleep(random.uniform(0.05, 0.12))
+
+    paced_sleep(random.uniform(0.08, 0.18))
+    log_event("typo", f"doubled letter: typed '{char}{char}{lookahead_str}', backspaced duplicate")
+    return True
+
+
+def _simulate_missed_space_typo(settings, text, idx, protection_mask):
+    """Simulates a missed space where two words run together (e.g. 'forthe').
+    Does not type the space; instead types 1-3 characters of the next word,
+    pauses, and backspaces them so the caller loop can type the space normally."""
+    lookahead = []
+    max_k = min(3, len(text) - (idx + 1))
+    for offset in range(1, max_k + 1):
+        pos = idx + offset
+        if protection_mask[pos] or text[pos] in ("\n", " "):
+            break
+        lookahead.append(text[pos])
+
+    if not lookahead:
+        return
+
+    k = random.randint(1, len(lookahead))
+    lookahead_str = "".join(lookahead[:k])
+
+    for lc in lookahead_str:
+        _send_char(settings, lc)
+        paced_sleep(random.uniform(0.06, 0.15))
+
+    # Delayed notice hesitation
+    paced_sleep(random.uniform(0.25, 0.55))
+
+    # Backspace all run-together characters (always finishes, even if Stop is
+    # pressed, so no run-together letters are ever left on screen)
+    for _ in range(len(lookahead_str)):
+        _send_backspace(settings)
+        paced_sleep(random.uniform(0.05, 0.12))
+
+    paced_sleep(random.uniform(0.08, 0.18))
+    log_event("typo", f"missed space: ran together into '{lookahead_str}', backspaced to insert space")
+
+
+def _act_out_smart_fix(settings, kind, wrong_text):
+    """Acts out one smart fix the way a real person would: types the slip
+    (wrong_text), pauses as if noticing it, then backspaces it. The caller
+    then types the correct text, so the screen ends up exactly as it would
+    have without this, and the final text never changes. Once the slip has
+    been typed, the backspaces always finish even if Stop is pressed, so no
+    stray characters are ever left behind. Returns False if Stop was
+    requested (the caller should return right away)."""
+    state.status = "Noticed a slip..."
+    typed_count = 0
+    for slip_char in wrong_text:
+        if stop_event.is_set():
+            break
+        _send_char(settings, slip_char)
+        typed_count += 1
+        paced_sleep(random.uniform(0.06, 0.15))
+
+    if typed_count and not stop_event.is_set():
+        paced_sleep(random.uniform(0.25, 0.55))  # the "wait, that's wrong" moment
+
+    for _ in range(typed_count):
+        _send_backspace(settings)
+        paced_sleep(random.uniform(0.05, 0.12))
+
+    if typed_count and not stop_event.is_set():
+        paced_sleep(random.uniform(0.08, 0.18))
+        log_event("smart_fix_noticed", kind)
+    return not stop_event.is_set()
+
+
+def _type_left_mistake(settings, entry, input_path):
+    """Types one purposely left mistake (Update #24) in place of the correct
+    text, and records it for the report window. Nothing is ever backspaced:
+    the mistake is meant to stay on screen for the person to find."""
+    typed = entry["typed"]
+    for typed_char in typed:
+        _send_char(settings, typed_char)
+        if len(typed) > 1:
+            paced_sleep(random.uniform(0.04, 0.10))
+
+    record = dict(entry)
+    record["file"] = os.path.basename(input_path)
+    state.left_mistakes.append(record)
+    log_event(
+        "mistake_left",
+        f"line {entry['line']}: {entry['label']}: typed {entry['typed_snippet']} "
+        f"(should be {entry['correct_snippet']})",
+    )
+
+
+def _note_blocked_time(seconds):
+    """Records time spent paused (by the person, by activity auto-pause, or
+    because focus was lost). That time is left out of the live WPM and ETA, is
+    not counted against a target time, and moves the target finish time later
+    by the same amount (Update #27)."""
+    state.paused_duration += seconds
+    state.blocked_seconds += seconds
+    if state.target_end_time > 0:
+        state.target_end_time += seconds
+
+
+def _wait_for_session_break(seconds, break_number, break_total):
+    """Waits `seconds` for a long session break (target time), in small steps
+    so Stop and Pause still work. While paused, the countdown freezes and picks
+    up where it left off. The status line always starts with "Session break":
+    the activity auto-pause watcher relies on that to ignore mouse movement,
+    because the person is expected to be away from the keyboard during a break.
+    Returns True when the wait finished, or False if Stop was requested."""
+    remaining = float(seconds)
+    last_tick = time.time()
+    while remaining > 0:
+        if stop_event.is_set():
+            return False
+
+        if pause_event.is_set():
+            block_start = time.time()
+            while pause_event.is_set():
+                if stop_event.is_set():
+                    return False
+                if not state.status.startswith("Activity detected"):
+                    state.status = "Paused"
+                time.sleep(0.2)
+            _note_blocked_time(time.time() - block_start)
+            last_tick = time.time()
+            continue
+
+        state.status = (
+            f"Session break {break_number} of {break_total} "
+            f"({format_duration_text(remaining)} left)..."
+        )
+        time.sleep(min(0.25, remaining))
+        now = time.time()
+        elapsed = now - last_tick
+        last_tick = now
+        remaining -= elapsed
+        state.paused_duration += elapsed
+    return True
+
+
+def _session_break_resume_countdown():
+    """A short warning countdown after a session break, used when no target
+    window is locked. It gives the person a moment to click back into the right
+    window before typing starts again. Returns False if Stop was requested."""
+    for seconds_left in range(SESSION_BREAK_RESUME_SECONDS, 0, -1):
+        if stop_event.is_set():
+            return False
+        state.status = f"Session break over, typing again in {seconds_left}s..."
+        time.sleep(1)
+        state.paused_duration += 1
+    return True
+
+
+def _wait_for_pause_marker(seconds):
+    """Waits `seconds` for an inline {{pause:N}} marker, in small steps so
+    Stop, Pause, and the activity auto-pause all still work during the
+    wait. While paused, the countdown freezes and picks up where it left
+    off. Returns True when the wait finished, or False if Stop was
+    requested (the caller should return right away).
+    Wait time is added to paused_duration so it is left out of the live
+    WPM and ETA, the same way research breaks are."""
+    remaining = float(seconds)
+    last_tick = time.time()
+    while remaining > 0:
+        if stop_event.is_set():
+            return False
+
+        if pause_event.is_set():
+            block_start = time.time()
+            while pause_event.is_set():
+                if stop_event.is_set():
+                    return False
+                if not state.status.startswith("Activity detected"):
+                    state.status = "Paused"
+                time.sleep(0.2)
+            _note_blocked_time(time.time() - block_start)
+            last_tick = time.time()
+            continue
+
+        state.status = f"Pause marker ({int(remaining + 0.999)}s left)..."
+        time.sleep(min(0.1, remaining))
+        now = time.time()
+        elapsed = now - last_tick
+        last_tick = now
+        remaining -= elapsed * _current_preview_speed()  # a preview plays faster (Update #53)
+        state.paused_duration += elapsed
+    return True
+
+
+# --------------------------------------------
+# SECOND REVISION PASS: going back and fixing the word (Update #34)
+# --------------------------------------------
+def _lookback_focus_ok(settings):
+    """True when typing may go on: no window is locked, or the locked window
+    is the active one. Preview runs have no target window to check."""
+    locked_window = settings.get("locked_window", "")
+    if not locked_window or not HAS_PYGETWINDOW or settings.get("preview_mode"):
+        return True
+    active = gw.getActiveWindow()
+    return (active.title if active else "") == locked_window
+
+
+def _lookback_gate(settings, check_focus):
+    """Called between the steps of a look-back fix. Waits while the run is
+    paused (and, when check_focus is True, while the locked window is not the
+    active one), then counts that time as blocked time. Returns False when Stop
+    was pressed, so the caller must stop right away."""
+    if stop_event.is_set():
+        return False
+    if not pause_event.is_set() and (not check_focus or _lookback_focus_ok(settings)):
+        return True
+    previous_status = state.status
+    block_start = time.time()
+    focus_alert_given = False
+    while True:
+        if stop_event.is_set():
+            return False
+        if pause_event.is_set():
+            if not state.status.startswith("Activity detected"):
+                state.status = "Paused"
+        elif check_focus and not _lookback_focus_ok(settings):
+            state.status = "Focus lost \u2014 paused"
+            if not focus_alert_given:
+                focus_alert_given = True
+                alert_auto_pause(settings)
+        else:
+            break
+        time.sleep(0.2)
+    _note_blocked_time(time.time() - block_start)
+    state.status = previous_status
+    return True
+
+
+def _lookback_sleep(settings, seconds):
+    """Waits `seconds` in small steps so Stop and Pause still work. Returns
+    False when Stop was pressed."""
+    for _ in range(int(seconds * 10)):
+        if not _lookback_gate(settings, False):
+            return False
+        paced_sleep(0.1)
+    return True
+
+
+def _press_arrow_key(settings, key, count):
+    """Presses the "left" or "right" arrow key exactly `count` times, a few at a
+    time, checking Stop and Pause between the groups. In preview mode nothing
+    is pressed, because the keys would go to whatever window has focus instead
+    of the preview. Returns False when Stop was pressed."""
+    remaining = count
+    while remaining > 0:
+        if not _lookback_gate(settings, False):
+            return False
+        chunk = min(LOOKBACK_KEY_CHUNK, remaining)
+        if settings.get("preview_mode"):
+            paced_sleep(chunk * random.uniform(0.01, 0.03))
+        else:
+            pyautogui.press(key, presses=chunk, interval=random.uniform(0.015, 0.04))
+        remaining -= chunk
+    return True
+
+
+def _run_lookback_fix(settings, edit, min_delay, max_delay):
+    """Goes back to the word that was typed as a synonym, replaces it with the
+    real word, and returns to the end of the paragraph. The Left and Right
+    presses use the same count, so the cursor ends up exactly where it began.
+    `state.lookback_pending` tracks how far along this is, so a Stop in the
+    middle can tell the person what to fix by hand. Returns False when Stop was
+    pressed. The log records only the distance, never the words."""
+    distance = edit["distance"]
+    draft = edit["draft"]
+    original = edit["original"]
+    preview = bool(settings.get("preview_mode"))
+    pending = state.lookback_pending
+
+    log_event("lookback_start", f"going back {distance} characters")
+    state.status = "Reading it over..."
+    if not _lookback_sleep(settings, random.uniform(1.0, 2.5)):
+        return False
+
+    # 1. Go back to the end of the swapped word.
+    state.status = "Going back to an earlier word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if not _press_arrow_key(settings, "left", distance):
+        return False
+    if not _lookback_sleep(settings, random.uniform(0.4, 1.0)):
+        return False
+
+    # 2. Delete the draft word and type the real one.
+    state.status = "Changing a word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if preview:
+        run_on_main_thread(
+            lambda d=distance, n=len(draft), o=original: _preview_replace_near_end(d, n, o)
+        )
+        paced_sleep(random.uniform(0.6, 1.2))
+    else:
+        for _ in range(len(draft)):
+            if not _lookback_gate(settings, False):
+                return False
+            _send_backspace(settings)
+            paced_sleep(random.uniform(0.08, 0.2))
+        if not _lookback_sleep(settings, random.uniform(0.3, 0.7)):
+            return False
+        if not _lookback_gate(settings, True):
+            return False
+        for char in original:
+            if not _lookback_gate(settings, False):
+                return False
+            _send_char(settings, char)
+            char_delay = random.uniform(min_delay, max_delay)
+            if char.isalpha():
+                char_delay += random.uniform(0.01, 0.03)
+            paced_sleep(char_delay)
+    if pending is not None:
+        pending["stage"] = "cursor"  # the text is right now, the cursor is still back there
+    if not _lookback_sleep(settings, random.uniform(0.3, 0.8)):
+        return False
+
+    # 3. Return to the end of the paragraph.
+    state.status = "Going back to the end..."
+    if not _lookback_gate(settings, False):
+        return False
+    if not _press_arrow_key(settings, "right", distance):
+        return False
+    state.lookback_pending = None
+    log_event("lookback_end", "back at the end of the paragraph")
+    state.status = "Typing..."
+    return True
+
+
+# --------------------------------------------
+# SELECT AND RETYPE, PLUS OVERSHOOT: the key presses (Update #35)
+# --------------------------------------------
+def _press_shift_left(settings, count):
+    """Selects the `count` characters to the left of the cursor by holding Shift
+    and pressing Left exactly `count` times, a few at a time, checking Stop and
+    Pause between the groups. Shift is let go after every group (even if
+    something goes wrong), so it is never left held while the run is paused. In
+    preview mode nothing is pressed, because the keys would go to whatever
+    window has focus instead of the preview. Returns False when Stop was
+    pressed."""
+    remaining = count
+    while remaining > 0:
+        if not _lookback_gate(settings, False):
+            return False
+        chunk = min(LOOKBACK_KEY_CHUNK, remaining)
+        if settings.get("preview_mode"):
+            paced_sleep(chunk * random.uniform(0.02, 0.05))
+        else:
+            pyautogui.keyDown("shift")
+            try:
+                pyautogui.press("left", presses=chunk, interval=random.uniform(0.03, 0.07))
+            finally:
+                pyautogui.keyUp("shift")
+        remaining -= chunk
+    return True
+
+
+def _run_select_retype(settings, edit, min_delay, max_delay):
+    """The second half of a select and retype. The draft word is already typed
+    and the cursor is right after it. This waits a moment (as if rereading the
+    word), selects the draft with Shift+Left, and types the real word over it.
+    `state.select_retype_pending` is set by the caller before the first key and
+    cleared here when the word is done, so a Stop in the middle can tell the
+    person what to fix by hand. Returns False when Stop was pressed. The log
+    records only the letter count, never the words."""
+    draft = edit["draft"]
+    original = edit["original"]
+    preview = bool(settings.get("preview_mode"))
+
+    log_event("select_retype_start", f"selecting {len(draft)} letters")
+    state.status = "Rereading the last word..."
+    if not _lookback_sleep(settings, random.uniform(0.7, 1.8)):
+        return False
+
+    # 1. Select the draft word (the cursor is still right after it).
+    state.status = "Selecting the word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if not _press_shift_left(settings, len(draft)):
+        return False
+    if not _lookback_sleep(settings, random.uniform(0.3, 0.8)):
+        return False
+
+    # 2. Type the real word over the highlighted one.
+    state.status = "Typing over the word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if preview:
+        run_on_main_thread(lambda n=len(draft), o=original: _preview_replace_near_end(0, n, o))
+        paced_sleep(random.uniform(0.4, 0.9))
+    else:
+        for char in original:
+            if not _lookback_gate(settings, False):
+                return False
+            _send_char(settings, char)
+            char_delay = random.uniform(min_delay, max_delay)
+            if char.isalpha():
+                char_delay += random.uniform(0.01, 0.03)
+            paced_sleep(char_delay)
+
+    state.select_retype_pending = None
+    log_event("select_retype_end", "")
+    state.status = "Typing..."
+    return True
+
+
+def _run_overshoot(settings, previous_letter):
+    """Presses Backspace one time too many (right after a typo was backspaced
+    away), notices, and types the deleted letter again, so the screen ends up
+    exactly as it was. Once the extra Backspace has been pressed, the letter is
+    always typed again, even if Stop is pressed, so no letter is ever left
+    missing. Returns False if Stop was requested (the caller should return
+    right away). The log records no letters."""
+    state.status = "Went back one letter too far..."
+    paced_sleep(random.uniform(0.04, 0.12))  # same quick burst as the last Backspace
+    if stop_event.is_set():
+        return False
+    _send_backspace(settings)
+    paced_sleep(random.uniform(0.25, 0.6))  # the "oops" moment
+    _send_char(settings, previous_letter)
+    paced_sleep(random.uniform(0.1, 0.25))
+    log_event("overshoot", "pressed Backspace one time too many and typed the letter again")
+    state.status = "Typing..."
+    return not stop_event.is_set()
+
+
+def type_text(settings, is_batch=False, is_last=True):
+    """Background-thread entry point. Reads the input file, then
+    types it out character by character with randomized delays,
+    simulated mistakes, and research breaks, honoring stop/pause/
+    focus-lock events throughout."""
+
+    input_path = settings["input_path"]
+    min_delay = settings["min_delay"]
+    max_delay = settings["max_delay"]
+    mistake_min = settings["mistake_min"]
+    mistake_max = settings["mistake_max"]
+    break_min = settings["break_min"]
+    break_max = settings["break_max"]
+    break_duration_min = settings["break_duration_min"]
+    break_duration_max = settings["break_duration_max"]
+    enable_mistakes = settings["enable_mistakes"]
+    enable_breaks = settings["enable_breaks"]
+    locked_window = settings["locked_window"]
+    enable_typos = settings["enable_typos"]
+    typo_chance = settings["typo_chance"]
+    use_extra_typos = settings.get("use_extra_typos", False)
+    enable_capital_slips = settings.get("enable_capital_slips", True)
+    paragraph_pause_min = settings["paragraph_pause_min"]
+    paragraph_pause_max = settings["paragraph_pause_max"]
+    sentence_pause_min = settings["sentence_pause_min"]
+    sentence_pause_max = settings["sentence_pause_max"]
+    enable_paraphrase = settings.get("enable_paraphrase", True)
+    paraphrase_chance = settings.get("paraphrase_chance", 15.0)
+    enable_fatigue = settings.get("enable_fatigue", False)
+    fatigue_strength = settings.get("fatigue_strength", 15.0)
+    enable_finger_timing = settings.get("enable_finger_timing", True)
+    enable_typing_moods = settings.get("enable_typing_moods", True)
+    typing_mood_strength = settings.get("typing_mood_strength", 100.0)
+    enable_difficulty_pauses = settings.get("enable_difficulty_pauses", True)
+    difficulty_pause_strength = settings.get("difficulty_pause_strength", 100.0)
+    enable_typing_bursts = settings.get("enable_typing_bursts", True)
+    burst_pause_strength = settings.get("burst_pause_strength", 100.0)
+    enable_decision_pauses = settings.get("enable_decision_pauses", True)
+    decision_pause_strength = settings.get("decision_pause_strength", 100.0)
+    enable_uneven_rhythm = settings.get("enable_uneven_rhythm", True)
+    rhythm_strength = settings.get("rhythm_strength", 100.0)
+    enable_writing_habits = settings.get("enable_writing_habits", True)
+    writing_habit_strength = settings.get("writing_habit_strength", 100.0)
+    enable_essay_pace = settings.get("enable_essay_pace", True)
+    essay_pace_strength = settings.get("essay_pace_strength", 100.0)
+    enable_warmup = settings.get("enable_warmup", True)
+    warmup_strength = settings.get("warmup_strength", 100.0)
+    smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
+    enable_overshoot = settings.get("enable_overshoot", True)
+    overshoot_chance = settings.get("overshoot_chance", 30.0)
+    # Real key press timing (Update #59). A preview presses no keys, so it never uses it.
+    key_hold_on = bool(settings.get("enable_key_hold", False)) and not settings.get("preview_mode")
+    key_overlap_on = key_hold_on and bool(settings.get("enable_key_overlap", False))
+    key_overlap_chance = settings.get("key_overlap_chance", KEY_OVERLAP_CHANCE_DEFAULT)
+    enable_revision_clusters = settings.get("enable_revision_clusters", True)
+    cluster_strength = settings.get("cluster_strength", 100.0)
+    revision_style = settings.get("revision_style", CLUSTER_STYLE_MIXED)
+    editor_mode = normalize_editor_mode(settings.get("editor_mode", EDITOR_MODE_PLAIN))
+
+    try:
+        text = read_input_file_text(input_path)
+    except FileNotFoundError:
+        run_on_main_thread(lambda: _fail_and_stop(
+            "Error", f"Could not find:\n{input_path}\n\nUse Browse to pick a valid text, Markdown, or Word file."
+        ))
+        return
+    except OSError as e:
+        error_msg = str(e)
+        run_on_main_thread(lambda: _fail_and_stop("Error", f"Could not read input file:\n{error_msg}"))
+        return
+
+    if not text:
+        run_on_main_thread(lambda: _info_and_stop("Empty File", "The selected input file is empty \u2014 nothing to type."))
+        return
+
+    # Pause markers are removed here too, and smart fixes (when switched on)
+    # are applied, so every position below (resume, protection, paraphrase,
+    # pauses, fix actions) refers to the same final text.
+    prepared = prepare_input_text(text, settings)
+    text = prepared.clean_text
+    protected_ranges = prepared.protected_ranges
+    pause_map = prepared.pause_map
+    format_map = prepared.format_map
+    fix_actions = prepared.fix_actions
+    state.clean_text = text  # stored so stop_typing() can compute the prefix hash
+    protection_mask = build_protection_mask(len(text), protected_ranges)
+    paraphrase_map = precompute_paragraph_paraphrases(text, protected_ranges)
+
+    resume_from = min(settings.get("resume_from", 0), len(text))
+
+    # Thinking pauses for hard words and hard sentences (Update #33). They are
+    # planned only for text that is still to be typed. If planning ever fails,
+    # the file is simply typed without them.
+    difficulty_plan = {}
+    if enable_difficulty_pauses and difficulty_pause_strength > 0:
+        try:
+            difficulty_plan = plan_difficulty_pauses(text, protection_mask, resume_from)
+        except Exception:
+            difficulty_plan = {}
+            log_event("difficulty_pauses_failed", "could not plan thinking pauses; typing without them")
+
+    # Pauses at decision points (Update #38): before a new paragraph, a claim, or
+    # a transition. Planned once, only for text still to be typed, and never at a
+    # spot that already has a pause marker or a difficulty pause. If planning
+    # ever fails, the file is typed without them.
+    decision_plan = {}
+    if enable_decision_pauses and decision_pause_strength > 0:
+        try:
+            decision_plan = plan_decision_pauses(
+                text, protection_mask, resume_from, set(pause_map) | set(difficulty_plan)
+            )
+        except Exception:
+            decision_plan = {}
+            log_event("decision_pauses_failed", "could not plan decision pauses; typing without them")
+
+    # Short pauses between bursts of typing (Update #37). Planned once, only for
+    # text still to be typed, and never at a spot that already has a pause marker,
+    # a difficulty pause, or a decision pause. If planning ever fails, the file is
+    # typed without them.
+    burst_plan = {}
+    if enable_typing_bursts and burst_pause_strength > 0:
+        try:
+            burst_plan = plan_typing_bursts(
+                text, protection_mask, resume_from,
+                set(pause_map) | set(difficulty_plan) | set(decision_plan)
+            )
+        except Exception:
+            burst_plan = {}
+            log_event("burst_pauses_failed", "could not plan burst pauses; typing without them")
+
+    # Writing habits (Update #41): a pause before a heading, an opening quote, or
+    # an aside, and a quicker or slower pace on commas. The habit profile comes
+    # from the text itself, so it stays the same through the whole run and a
+    # resume. Planned once, only for text still to be typed, never in protected
+    # text, and never at a spot that already has another pause. If planning ever
+    # fails, the file is typed without them.
+    habit_plan = {}
+    habit_chances = {}
+    comma_pace_scale = 1.0
+    if enable_writing_habits and writing_habit_strength > 0:
+        try:
+            habit_profile = get_writing_habit_profile(text)
+            habit_chances = get_writing_habit_chances(habit_profile)
+            comma_pace_scale = get_comma_pace_scale(habit_profile, writing_habit_strength)
+            habit_plan = plan_writing_habits(
+                text, protection_mask, habit_chances, resume_from,
+                set(pause_map) | set(difficulty_plan) | set(decision_plan) | set(burst_plan)
+            )
+            habit_counts = summarize_writing_habit_plan(habit_plan)
+            planned_text = ", ".join(
+                f"{kind} {count}" for kind, count in sorted(habit_counts.items())
+            ) or "no spots"
+            log_event("writing_habits", describe_writing_habit_profile(habit_profile)
+                      + "; planned " + planned_text)
+        except Exception:
+            habit_plan = {}
+            habit_chances = {}
+            comma_pace_scale = 1.0
+            log_event("writing_habits_failed", "could not plan writing habits; typing without them")
+
+    # Essay pace (Update #42): a slower opening and closing that stop now and then
+    # to plan, and a quicker body. The speed comes from where each character sits
+    # in the file. The pauses are planned once, only for text still to be typed,
+    # and never at a spot that already has another pause. Files shorter than
+    # ESSAY_MIN_CHARS are left alone. If planning ever fails, the file is typed
+    # at an even pace.
+    essay_pause_plan = {}
+    essay_pace_on = False
+    if enable_essay_pace and essay_pace_strength > 0 and len(text) >= ESSAY_MIN_CHARS:
+        try:
+            essay_pause_plan = plan_essay_pauses(
+                text, protection_mask, resume_from,
+                set(pause_map) | set(difficulty_plan) | set(decision_plan)
+                | set(burst_plan) | set(habit_plan)
+            )
+            essay_pace_on = True
+            essay_counts = summarize_essay_pause_plan(essay_pause_plan)
+            log_event("essay_pace", "planned " + (", ".join(
+                f"{zone} {count}" for zone, count in sorted(essay_counts.items())
+            ) or "no") + " pause spot(s)")
+        except Exception:
+            essay_pause_plan = {}
+            essay_pace_on = False
+            log_event("essay_pace_failed", "could not plan the essay pace; typing at an even pace")
+
+    # Uneven rhythm (Update #40): familiar words and phrases a little quicker;
+    # names, technical terms, punctuation, and hedged claims a little slower.
+    # Planned once, only for text still to be typed, and never in protected
+    # text. If planning ever fails, the file is typed at an even speed.
+    rhythm_plan = {}
+    rhythm_multipliers = {}
+    if enable_uneven_rhythm and rhythm_strength > 0:
+        try:
+            rhythm_plan = plan_uneven_rhythm(text, protection_mask, resume_from)
+            rhythm_multipliers = {
+                kind: get_rhythm_multiplier(kind, rhythm_strength) for kind in RHYTHM_BASE_MULTIPLIERS
+            }
+            if rhythm_plan:
+                counts = summarize_rhythm_plan(rhythm_plan)
+                log_event("uneven_rhythm", "planned " + ", ".join(
+                    f"{kind} {count}" for kind, count in sorted(counts.items())) + " characters")
+        except Exception:
+            rhythm_plan = {}
+            log_event("uneven_rhythm_failed", "could not plan uneven rhythm; typing at an even speed")
+
+    # Mistakes to purposely leave for the person to fix (Update #24). They are
+    # planned only for text that is still to be typed. If planning ever fails,
+    # the file is simply typed without them.
+    left_mistake_map = {}
+    if get_left_mistake_options(settings) is not None:
+        if resume_from > 0:
+            state.left_mistakes_resumed = True
+        try:
+            # A format shortcut may not sit inside a two-character mistake, so
+            # those spots are handled like pause markers.
+            left_mistake_map = plan_left_mistakes(
+                text, protection_mask, settings, resume_from,
+                set(pause_map) | set(format_map), set(fix_actions.keys())
+            )
+        except Exception:
+            left_mistake_map = {}
+            log_event("leave_mistakes_failed", "could not plan mistakes; typing without them")
+
+    state.total_chars = len(text)
+    state.total_newlines = text.count("\n")
+    state.chars_typed = resume_from
+    state.lookback_pending = None
+    state.select_retype_pending = None
+
+    # Revision clusters (Update #39): short stretches where typos, reworks, and
+    # other edits bunch together, with calmer stretches in between. Planned
+    # once, only for text still to be typed. The two weights keep the average
+    # number of mistakes the same. If planning ever fails, mistakes are spread
+    # evenly, as before.
+    cluster_flags = None
+    cluster_weight = 1.0
+    calm_weight = 1.0
+    revision_features_on = (
+        enable_typos or enable_mistakes or enable_paraphrase
+        or settings.get("enable_lookback_edit", False)
+        or settings.get("enable_select_retype", False)
+    )
+    if enable_revision_clusters and cluster_strength > 0 and revision_features_on:
+        try:
+            cluster_zones = plan_revision_clusters(text, resume_from, revision_style)
+            if cluster_zones:
+                cluster_flags = build_cluster_flags(len(text), cluster_zones)
+                chars_left = max(len(text) - resume_from, 1)
+                cluster_chars = sum(cluster_flags[resume_from:])
+                cluster_weight, calm_weight = get_cluster_weights(cluster_chars / chars_left, cluster_strength)
+                log_event(
+                    "revision_clusters",
+                    f"planned {len(cluster_zones)} cluster(s) covering {cluster_chars} of {chars_left} "
+                    f"characters, style {normalize_cluster_style(revision_style)}",
+                )
+        except Exception:
+            cluster_flags = None
+            cluster_weight = 1.0
+            calm_weight = 1.0
+            log_event("revision_clusters_failed", "could not plan revision clusters; spreading mistakes evenly")
+
+    # Second revision pass (Update #34): words to type as a synonym first and
+    # fix after the paragraph. Planned only for text that is still to be typed.
+    # If planning ever fails, the file is simply typed without them.
+    lookback_swaps = {}
+    lookback_fixes = {}
+    if settings.get("enable_lookback_edit", False):
+        try:
+            lookback_swaps, lookback_fixes = plan_lookback_edits(
+                text, protection_mask, settings, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map, cluster_flags
+            )
+        except Exception:
+            lookback_swaps = {}
+            lookback_fixes = {}
+            log_event("lookback_failed", "could not plan second revision edits; typing without them")
+        if lookback_swaps:
+            log_event("lookback_planned", f"{len(lookback_swaps)} paragraph(s)")
+
+    # Select and retype (Update #35): words to type as a synonym, then select
+    # with Shift+Left and type over. Planned only for text that is still to be
+    # typed, and never on a word the second revision pass uses. If planning ever
+    # fails, the file is simply typed without them.
+    select_retype_plan = {}
+    if settings.get("enable_select_retype", False):
+        try:
+            select_retype_plan = plan_select_retypes(
+                text, protection_mask, settings, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps, cluster_flags
+            )
+        except Exception:
+            select_retype_plan = {}
+            log_event("select_retype_failed", "could not plan select and retype; typing without them")
+        if select_retype_plan:
+            log_event("select_retype_planned", f"{len(select_retype_plan)} word(s)")
+    state.newlines_typed = text[:resume_from].count("\n")
+    state.paused_duration = 0.0
+    state.status = "Countdown..."
+    # Only the file's name goes in the log, never the full folder path.
+    log_event("session_start", f"file={os.path.basename(input_path)}, chars={state.total_chars}, resumed_from={resume_from}")
+    if prepared.fixes:
+        log_event("smart_fixes_planned", summarize_smart_fixes(prepared.fixes))
+
+    # START COUNTDOWN (skipped in preview mode -- there's no target window to
+    # switch focus to before typing starts). The length comes from the Start
+    # Countdown setting (0 to 60 seconds, 10 by default). 0 means no wait.
+    if not settings.get("preview_mode"):
+        countdown_seconds = clamp_start_countdown(
+            settings.get("start_countdown_seconds", START_COUNTDOWN_DEFAULT)
+        )
+        for i in range(countdown_seconds, 0, -1):
+            if stop_event.is_set():
+                return
+            state.status = f"Starting in {i}..."
+            time.sleep(1)
+
+    state.status = "Typing..."
+    state.start_time = time.time()
+    log_event("typing_start", "")
+
+    # TARGET TIME (Update #27): plan the long session breaks. Preview runs
+    # skip this so a preview never waits for hours. If planning ever fails,
+    # the file is simply typed without session breaks.
+    session_plan = []
+    session_break_index = 0
+    session_break_total = 0.0  # time spent in session breaks so far
+    file_target_seconds = settings.get("target_seconds_for_file", 0.0)
+    plan_start_time = time.time()
+    plan_blocked_start = state.blocked_seconds
+    state.target_end_time = 0.0
+    state.session_breaks_left = 0
+    if file_target_seconds > 0 and not settings.get("preview_mode"):
+        try:
+            session_plan, spare_seconds, typing_seconds = plan_session_breaks(
+                text, protection_mask, pause_map, settings, resume_from, file_target_seconds
+            )
+        except Exception:
+            session_plan = []
+            spare_seconds = 0.0
+            typing_seconds = 0.0
+            log_event("target_time_failed", "could not plan session breaks; typing without them")
+        state.target_end_time = plan_start_time + file_target_seconds
+        state.session_breaks_left = len(session_plan)
+        log_event(
+            "target_time_plan",
+            f"target={format_duration_text(file_target_seconds)}, "
+            f"estimated typing={format_duration_text(typing_seconds)}, "
+            f"spare={format_duration_text(max(spare_seconds, 0))}, breaks={len(session_plan)}",
+        )
+
+    word_count = 0
+    para_count = 0
+    next_mistake_target = random.randint(mistake_min, mistake_max) if enable_mistakes else None
+    next_break_target = random.randint(break_min, break_max) if enable_breaks else None
+    state.next_mistake_words = next_mistake_target if next_mistake_target else 0
+    state.next_break_paragraphs = next_break_target if next_break_target else 0
+
+    prev_char = text[resume_from - 1] if resume_from > 0 else ""
+    last_focus_check = 0.0
+    # Seed the rework buffer with real text already typed before this
+    # point (back to the last paragraph break), so reworks right
+    # after resuming still have real context instead of an empty one.
+    last_newline_idx = text.rfind("\n", 0, resume_from)
+    recent_typed_buffer = text[last_newline_idx + 1:resume_from] if last_newline_idx != -1 else text[:resume_from]
+    if len(recent_typed_buffer) > 120:
+        recent_typed_buffer = recent_typed_buffer[-120:]
+
+    # Multiplier starts fresh on run start and resume-from-checkpoint
+    fatigue_chars = 0
+
+    # Flow and hesitation states (Update #31). None when switched off or at 0%.
+    # Like fatigue, a resumed run starts in the normal state.
+    typing_mood = TypingMood(typing_mood_strength) if enable_typing_moods and typing_mood_strength > 0 else None
+
+    # Warm-up after breaks (Update #45). None when switched off or at 0%. Like
+    # fatigue and mood, a run (or a resumed run) starts with no warm-up. A long
+    # wait calls note_warm_up(), and the next 20 or so keys type a little slower.
+    # Only the reason and the spot (never the text) go in the log.
+    warm_up = TypingWarmUp(warmup_strength) if enable_warmup and warmup_strength > 0 else None
+
+    def note_warm_up(wait_seconds, reason, from_index):
+        if warm_up is not None and warm_up.note_wait(wait_seconds):
+            log_event("warm_up", f"easing back in after {reason}, from character {from_index}")
+
+    # Tracks when we last wrote an autosave checkpoint. Initialized to 0
+    # so the first eligible sentence-end immediately saves.
+    last_autosave_time = 0.0
+
+    # Leave-mistakes bookkeeping. left_skip_until: a two-character mistake
+    # (swapped letters) types both characters at once, so the loop skips the
+    # second one. rework_hold: True from a left mistake until the next word
+    # break, so a sentence rework never deletes or retypes the mistake.
+    left_skip_until = 0
+    rework_hold = False
+
+    # Formatting markers (Update #29): the styles that are on right now. When
+    # resuming, every shortcut before the resume point counts as already
+    # pressed, so the person should click right after the last typed character.
+    active_formats = set()
+    for format_position in sorted(format_map):
+        if format_position >= resume_from:
+            break
+        active_formats ^= set(format_map[format_position])
+
+    # CHARACTER TYPING LOOP
+    for idx in range(resume_from, len(text)):
+        char = text[idx]
+        is_protected = protection_mask[idx]
+        # Update #39: how likely a mistake is here. Above 1 inside a revision
+        # cluster, below 1 in the calm stretches, 1 when there are no clusters.
+        zone_weight = 1.0
+        if cluster_flags:
+            zone_weight = cluster_weight if cluster_flags[idx] else calm_weight
+        if stop_event.is_set():
+            return
+        if idx < left_skip_until:
+            continue
+
+        # --------------------------------
+        # SESSION BREAK (target time, Update #27)
+        # A long break at a planned paragraph or sentence start. Its length
+        # is worked out now from the time that is really left, so the run
+        # finishes close to the target. Like the pause marker below, this runs
+        # BEFORE the focus-lock check, so after a long wait the check runs
+        # right away and catches a window switch before anything is typed.
+        # --------------------------------
+        if session_break_index < len(session_plan) and idx >= session_plan[session_break_index]["position"]:
+            planned_break = session_plan[session_break_index]
+            weights_left = [item["weight"] for item in session_plan[session_break_index:]]
+            elapsed_active = (
+                time.time() - plan_start_time - session_break_total
+                - (state.blocked_seconds - plan_blocked_start)
+            )
+            break_seconds = compute_session_break_seconds(
+                text, settings, protection_mask, pause_map, resume_from, idx,
+                file_target_seconds, elapsed_active, session_break_total,
+                planned_break["weight"], sum(weights_left),
+            )
+            session_break_index += 1
+            state.session_breaks_left = len(session_plan) - session_break_index
+            if break_seconds > 0:
+                log_event(
+                    "session_break_start",
+                    f"~{format_duration_text(break_seconds)}, break {session_break_index} of {len(session_plan)}",
+                )
+                break_started = time.time()
+                blocked_before_break = state.blocked_seconds
+                break_finished = _wait_for_session_break(break_seconds, session_break_index, len(session_plan))
+                if break_finished and not settings.get("preview_mode") and not (locked_window and HAS_PYGETWINDOW):
+                    break_finished = _session_break_resume_countdown()
+                # The person's own pauses during the break are counted separately.
+                session_break_total += (time.time() - break_started) - (state.blocked_seconds - blocked_before_break)
+                if not break_finished:
+                    return
+                log_event("session_break_end", "")
+                if enable_fatigue:
+                    fatigue_chars = 0  # a long rest fully recovers from fatigue
+                if typing_mood is not None:
+                    typing_mood.reset()  # and the typist starts fresh in the normal state
+                note_warm_up(break_seconds, "a session break", idx)
+                state.status = "Typing..."
+            else:
+                log_event("session_break_skipped", "no spare time left for this break")
+
+        # --------------------------------
+        # INLINE PAUSE MARKER ({{pause:N}})
+        # Runs BEFORE the focus-lock check on purpose: after a long
+        # wait the focus check is overdue, so it runs right away and
+        # catches a window switch before the next character is typed.
+        # --------------------------------
+        marker_seconds = pause_map.get(idx)
+        if marker_seconds:
+            log_event("pause_marker", f"{marker_seconds:g}s before character {idx}")
+            if not _wait_for_pause_marker(marker_seconds):
+                return
+            note_warm_up(marker_seconds, "a pause marker", idx)
+            state.status = "Typing..."
+
+        # --------------------------------
+        # DIFFICULTY THINKING PAUSE (Update #33)
+        # A short stop before a hard word, or a longer one before a hard
+        # sentence. Like the pause marker above, it runs BEFORE the focus-lock
+        # and pause checks, so a Pause press or a window switch during the
+        # wait is caught before the next character is typed. Only the spot
+        # (never the text) goes in the log.
+        # --------------------------------
+        difficulty_spot = difficulty_plan.get(idx)
+        if difficulty_spot:
+            difficulty_kind, difficulty_weight = difficulty_spot
+            think_seconds = draw_difficulty_pause_seconds(
+                difficulty_kind, difficulty_weight, difficulty_pause_strength
+            )
+            if think_seconds > 0:
+                if difficulty_kind == "sentence":
+                    state.status = "Thinking about how to phrase this..."
+                else:
+                    state.status = "Thinking of the right word..."
+                log_event("difficulty_pause", f"{difficulty_kind} ~{think_seconds:.1f}s before character {idx}")
+                for _ in range(int(think_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    paced_sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # DECISION PAUSE (Update #38)
+        # A stop before a new paragraph, a claim, or a transition, where a
+        # writer decides what to say next. It runs at the same place as the
+        # difficulty pause (BEFORE the focus-lock and pause checks), stays
+        # stoppable and pausable, and is not added to paused_duration. Only the
+        # spot and kind (never the text) go in the log.
+        # --------------------------------
+        decision_spot = decision_plan.get(idx)
+        if decision_spot:
+            decision_kind, decision_weight = decision_spot
+            decision_seconds = draw_decision_pause_seconds(
+                decision_kind, decision_weight, decision_pause_strength
+            )
+            if decision_seconds > 0:
+                if decision_kind == DECISION_PARAGRAPH:
+                    state.status = "Deciding what to write next..."
+                elif decision_kind == DECISION_CLAIM:
+                    state.status = "Thinking about how to make this point..."
+                else:
+                    state.status = "Deciding where the argument goes next..."
+                log_event("decision_pause", f"{decision_kind} ~{decision_seconds:.1f}s before character {idx}")
+                for _ in range(int(decision_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    paced_sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # BURST PAUSE (Update #37)
+        # A short stop between bursts of typing, like a person who writes a
+        # phrase and then thinks. It runs at the same place as the difficulty
+        # pause (BEFORE the focus-lock and pause checks), stays stoppable and
+        # pausable, and is not added to paused_duration. Only the spot and
+        # length (never the text) go in the log.
+        # --------------------------------
+        burst_kind = burst_plan.get(idx)
+        if burst_kind:
+            burst_seconds = draw_burst_pause_seconds(burst_kind, burst_pause_strength)
+            if burst_seconds > 0:
+                state.status = "Pausing to think..."
+                log_event("burst_pause", f"{burst_kind} ~{burst_seconds:.1f}s before character {idx}")
+                for _ in range(int(burst_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    paced_sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # WRITING HABIT PAUSE (Update #41)
+        # A short stop before a heading, an opening quotation mark, or an aside
+        # (a parenthesis or dash), for the kinds of spot that are a habit for
+        # this writer. It runs at the same place as the pauses above (BEFORE the
+        # focus-lock and pause checks), stays stoppable and pausable, and is not
+        # added to paused_duration. Only the spot and kind (never the text) go
+        # in the log.
+        # --------------------------------
+        habit_kind = habit_plan.get(idx)
+        if habit_kind:
+            habit_seconds = draw_writing_habit_seconds(
+                habit_kind, habit_chances.get(habit_kind, 0.0), writing_habit_strength
+            )
+            if habit_seconds > 0:
+                state.status = HABIT_STATUS[habit_kind]
+                log_event("writing_habit_pause", f"{habit_kind} ~{habit_seconds:.1f}s before character {idx}")
+                for _ in range(int(habit_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    paced_sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # ESSAY PACE PAUSE (Update #42)
+        # A short stop at a sentence start in the opening (planning) or the
+        # closing (deciding how to end). It runs at the same place as the pauses
+        # above (BEFORE the focus-lock and pause checks), stays stoppable and
+        # pausable, and is not added to paused_duration. Only the spot and zone
+        # (never the text) go in the log.
+        # --------------------------------
+        essay_zone = essay_pause_plan.get(idx)
+        if essay_zone:
+            essay_seconds = draw_essay_pause_seconds(essay_zone, essay_pace_strength)
+            if essay_seconds > 0:
+                state.status = ESSAY_STATUS[essay_zone]
+                log_event("essay_pause", f"{essay_zone} ~{essay_seconds:.1f}s before character {idx}")
+                for _ in range(int(essay_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    paced_sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # FOCUS-LOCK CHECK (throttled to ~2x/sec so we're not
+        # calling into the OS window manager on every keystroke)
+        # --------------------------------
+        if locked_window and HAS_PYGETWINDOW:
+            now = time.time()
+            if now - last_focus_check > 0.5:
+                last_focus_check = now
+                active = gw.getActiveWindow()
+                active_title = active.title if active else ""
+                if active_title != locked_window:
+                    if not focus_lost_event.is_set():
+                        focus_lost_event.set()
+                        log_event("focus_lost", f"active window now '{active_title}'")
+                        alert_auto_pause(settings)
+                else:
+                    if focus_lost_event.is_set():
+                        focus_lost_event.clear()
+                        log_event("focus_regained", "")
+
+        # --------------------------------
+        # PAUSE / FOCUS-LOST HANDLING
+        # Blocks here until both conditions clear, then folds the
+        # elapsed block time into paused_duration exactly once.
+        # --------------------------------
+        if pause_event.is_set() or focus_lost_event.is_set():
+            block_start = time.time()
+            while pause_event.is_set() or focus_lost_event.is_set():
+                if stop_event.is_set():
+                    return
+                if focus_lost_event.is_set():
+                    state.status = "Focus lost \u2014 paused"
+                    if HAS_PYGETWINDOW:
+                        active = gw.getActiveWindow()
+                        active_title = active.title if active else ""
+                        if active_title == locked_window:
+                            focus_lost_event.clear()
+                elif pause_event.is_set():
+                    if not state.status.startswith("Activity detected"):
+                        state.status = "Paused"
+                time.sleep(0.2)
+            _note_blocked_time(time.time() - block_start)
+            note_warm_up(time.time() - block_start, "a long pause", idx)
+            state.status = "Typing..."
+
+        # --------------------------------
+        # EDITOR TYPE (Update #58)
+        # Runs at the start of every line, after any wait and the focus check,
+        # so the keys go to the right window.
+        #   Code editor: the editor's own indent after Enter is cleared, so the
+        #   line's own spaces are not added on top of it.
+        #   Google Docs or Word: a list marker such as "1. " or "- " is typed
+        #   in a different key order, so the editor does not make a list. The
+        #   marker and its space are typed as one unit, so it is only used when
+        #   nothing else is planned for those positions.
+        # Plain text and Preview runs skip all of this.
+        # --------------------------------
+        if editor_mode != EDITOR_MODE_PLAIN and not settings.get("preview_mode"):
+            editor_action = plan_editor_line_start(editor_mode, text, idx)
+            if editor_action is not None:
+                editor_kind, editor_lead, editor_marker = editor_action
+                if editor_kind == EDITOR_ACTION_CLEAR_INDENT:
+                    _run_editor_clear_indent(settings)
+                    if stop_event.is_set():
+                        return
+                else:
+                    marker_span = len(editor_lead) + len(editor_marker) + 1
+                    if (editor_marker_span_is_clear(
+                            idx, marker_span,
+                            (format_map, left_mistake_map, lookback_swaps, select_retype_plan, fix_actions))
+                            and editor_marker_span_is_clear(idx + 1, marker_span - 1, (pause_map,))):
+                        _run_editor_list_marker(settings, editor_lead, editor_marker, min_delay, max_delay)
+                        left_skip_until = idx + marker_span
+                        state.chars_typed += marker_span
+                        prev_char = " "
+                        recent_typed_buffer = ""
+                        if stop_event.is_set():
+                            return
+                        continue
+
+        # --------------------------------
+        # PARAGRAPH-ENDING PARAPHRASE-THEN-CORRECT (Idea #10)
+        # --------------------------------
+        # Skipped while a style is on: deleting the drafted sentence could drop
+        # the bold or italic from the cursor in some editors (Update #29).
+        if enable_paraphrase and idx in paraphrase_map and not is_protected and not active_formats:
+            candidate = paraphrase_map.pop(idx, None)
+            if candidate and random.uniform(0, 100) < min(100.0, paraphrase_chance * zone_weight):
+                _end_idx, paraphrased_text, original_text = candidate
+                state.status = "Drafting paraphrase..."
+                log_event("paraphrase_rework", f"drafted: '{paraphrased_text}'")
+                typed_paraphrase_chars = 0
+
+                for p_char in paraphrased_text:
+                    if stop_event.is_set():
+                        # Take back the part already typed, so no draft is left on screen.
+                        _erase_typed_text(settings, typed_paraphrase_chars)
+                        return
+                    _send_char(settings, p_char)
+                    typed_paraphrase_chars += 1
+                    p_delay = random.uniform(min_delay, max_delay)
+                    if p_char.isalpha():
+                        p_delay += random.uniform(0.01, 0.03)
+                    if typing_mood is not None:
+                        p_delay *= typing_mood.step()[0]
+                    if enable_fatigue:
+                        p_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
+                        fatigue_chars += 1
+                    paced_sleep(p_delay)
+
+                state.status = "Reconsidering phrasing..."
+                reconsider_pause = random.uniform(0.8, 1.8)
+                for _ in range(int(reconsider_pause * 10)):
+                    if stop_event.is_set():
+                        _erase_typed_text(settings, typed_paraphrase_chars)
+                        return
+                    paced_sleep(0.1)
+
+                state.status = "Deleting and rewriting..."
+                # One Backspace per typed character (Update #52), not Ctrl+Backspace.
+                _erase_typed_text(settings, typed_paraphrase_chars)
+                if stop_event.is_set():
+                    return
+
+                paced_sleep(random.uniform(0.3, 0.6))
+                word_count = 0  # avoid immediately firing mistake rework
+                state.status = "Typing..."
+
+        # --------------------------------
+        # MISTAKE SIMULATION: pause, reconsider, delete and retype
+        # the last few words actually typed. Not gibberish -- this
+        # mirrors how people really hesitate: they pause, backspace
+        # what they just wrote, then type the same thing again
+        # (the final text has to stay exactly correct either way).
+        # --------------------------------
+        if enable_mistakes and char == " " and not is_protected:
+            word_count += zone_weight
+            if word_count >= next_mistake_target:
+                words_in_buffer = _REWORK_WORD_PATTERN.findall(recent_typed_buffer)
+                if rework_hold:
+                    # A mistake was purposely left in the last few words.
+                    # Never redo them, or the mistake would be erased.
+                    words_in_buffer = []
+                redo_count = min(random.randint(2, 4), len(words_in_buffer))
+                if active_formats:
+                    # Keep at least one word of the formatted text, so the first
+                    # formatted character is never deleted (an editor could drop
+                    # the style when that happens). Update #29.
+                    redo_count = min(redo_count, len(words_in_buffer) - 1)
+                # The exact text on screen for those words, spaces and all (Update #52).
+                redo_text = get_rework_text(recent_typed_buffer, redo_count) if redo_count > 0 else ""
+                if redo_text:
+                    state.status = "Reworking last words..."
+                    log_event("sentence_rework", f"redid: '{redo_text}'")
+
+                    paced_sleep(random.uniform(0.6, 1.5))
+                    if stop_event.is_set():
+                        return
+                    # One Backspace per character, then the same text again. Once
+                    # the first Backspace is pressed this always finishes, even if
+                    # Stop is pressed, so no words are ever left deleted.
+                    _erase_typed_text(settings, len(redo_text))
+                    paced_sleep(random.uniform(0.3, 0.8))
+                    _send_char(settings, redo_text)
+                    paced_sleep(random.uniform(0.2, 0.5))
+
+                    state.status = "Typing..."
+
+                word_count = 0
+                next_mistake_target = random.randint(mistake_min, mistake_max)
+                state.next_mistake_words = next_mistake_target
+        if enable_mistakes:
+            state.next_mistake_words = math.ceil(max(next_mistake_target - word_count, 0))
+
+        # --------------------------------
+        # SECOND REVISION PASS: go back and fix the word (Update #34)
+        # Runs at the end of the paragraph, before the thinking pause and
+        # before the line break is typed. Only if the draft word was really
+        # typed. Arrow keys go back and forth by the same count.
+        # --------------------------------
+        lookback_fix = lookback_fixes.get(idx)
+        if lookback_fix is not None and lookback_fix["swapped"]:
+            if not _run_lookback_fix(settings, lookback_fix, min_delay, max_delay):
+                return
+
+        # --------------------------------
+        # PARAGRAPH THINKING PAUSE: always happens at the end of a
+        # paragraph, independent of whether a research break is also
+        # enabled or due -- pausing to think about what's next is
+        # normal even when not stepping away entirely.
+        # --------------------------------
+        if char == "\n":
+            thinking_pause = random.uniform(paragraph_pause_min, paragraph_pause_max)
+            state.status = "Thinking about what's next..."
+            for _ in range(int(thinking_pause * 10)):
+                if stop_event.is_set() or pause_event.is_set():
+                    break
+                paced_sleep(0.1)
+            if stop_event.is_set():
+                return
+            if not pause_event.is_set():
+                state.status = "Typing..."
+                note_warm_up(thinking_pause, "a long paragraph pause", idx + 1)
+
+        # --------------------------------
+        # RESEARCH BREAKS
+        # --------------------------------
+        if enable_breaks and char == "\n":
+            para_count += 1
+            if para_count >= next_break_target:
+                break_duration = random.uniform(break_duration_min, break_duration_max)
+                state.status = f"Research Break ({int(break_duration)}s left)..."
+                log_event("research_break_start", f"~{break_duration:.0f}s")
+                break_start = time.time()
+                break_skipped = False
+
+                # Skip Break (Update #50) only works while this countdown runs,
+                # so it can never skip a break before it starts.
+                skip_break_event.clear()
+                state.in_research_break = True
+                run_on_main_thread(refresh_skip_break_button)
+
+                total_ticks = int(break_duration * 10)
+                for tick in range(total_ticks):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    if skip_break_event.is_set():
+                        break_skipped = True
+                        break
+                    if tick % 10 == 0:
+                        remaining = max(0, int(break_duration) - (tick // 10))
+                        state.status = f"Research Break ({remaining}s left)..."
+                    paced_sleep(0.1)
+
+                state.in_research_break = False
+                skip_break_event.clear()
+                run_on_main_thread(refresh_skip_break_button)
+
+                break_seconds = time.time() - break_start
+                state.paused_duration += break_seconds
+                if break_skipped:
+                    log_event("research_break_skipped", f"after {break_seconds:.0f}s of ~{break_duration:.0f}s")
+                log_event("research_break_end", "")
+                note_warm_up(break_seconds, "a research break", idx + 1)
+
+                if enable_fatigue:
+                    # Partly recover from fatigue after a research break
+                    fatigue_chars = int(fatigue_chars * 0.25)
+                if typing_mood is not None:
+                    typing_mood.reset()  # a research break also clears the mood
+
+                para_count = 0
+                next_break_target = random.randint(break_min, break_max)
+                state.next_break_paragraphs = next_break_target
+                state.status = "Typing..."
+        if enable_breaks:
+            state.next_break_paragraphs = max(next_break_target - para_count, 0)
+
+        # --------------------------------
+        # SMART FIX "NOTICED A SLIP" (Update #22)
+        # Some planned fixes are acted out: the typer makes the slip,
+        # pauses, and backspaces it before typing the correct text. The
+        # chance comes from the 'Show fixes being noticed' setting. The
+        # fixed text itself was already decided before typing began.
+        # --------------------------------
+        fix_acts = fix_actions.get(idx)
+        if fix_acts and smart_fix_visible_chance > 0:
+            for fix_kind, slip_text in fix_acts:
+                if random.uniform(0, 100) >= smart_fix_visible_chance:
+                    continue
+                if not _act_out_smart_fix(settings, fix_kind, slip_text):
+                    return
+            state.status = "Typing..."
+
+        # --------------------------------
+        # SECOND REVISION PASS: type the draft (synonym) word (Update #34)
+        # The real word is put back when the paragraph ends. Everything that
+        # tracks the word (progress, rework buffer, previous letter) follows
+        # what is really on screen. state.lookback_pending is set BEFORE the
+        # first key, so a Stop in the middle can tell the person what to fix.
+        # --------------------------------
+        lookback_edit = lookback_swaps.get(idx)
+        if lookback_edit is not None and not is_protected and not active_formats:
+            draft_word = lookback_edit["draft"]
+            state.lookback_pending = {
+                "draft": draft_word, "original": lookback_edit["original"], "stage": "reworded",
+            }
+            for draft_char in draft_word:
+                if stop_event.is_set():
+                    return
+                _send_char(settings, draft_char)
+                draft_delay = random.uniform(min_delay, max_delay)
+                if draft_char.isalpha():
+                    draft_delay += random.uniform(0.01, 0.03)
+                if typing_mood is not None:
+                    draft_delay *= typing_mood.step()[0]
+                if enable_fatigue:
+                    draft_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
+                    fatigue_chars += 1
+                paced_sleep(draft_delay)
+            lookback_edit["swapped"] = True
+            left_skip_until = lookback_edit["end"]
+            state.chars_typed += lookback_edit["end"] - idx
+            prev_char = draft_word[-1]
+            recent_typed_buffer = (recent_typed_buffer + draft_word)[-120:]
+            continue
+
+        # --------------------------------
+        # SELECT AND RETYPE (Update #35)
+        # The draft (synonym) word is typed, then Shift+Left selects exactly its
+        # letters and the real word is typed over it. state.select_retype_pending
+        # is set BEFORE the first key, so a Stop in the middle can tell the person
+        # what to fix by hand. chars_typed only moves once the word is done, so a
+        # resume starts again at this word.
+        # --------------------------------
+        select_edit = select_retype_plan.get(idx)
+        if (select_edit is not None and not is_protected and not active_formats
+                and idx not in left_mistake_map):
+            select_draft = select_edit["draft"]
+            state.select_retype_pending = {"draft": select_draft, "original": select_edit["original"]}
+            for draft_char in select_draft:
+                if stop_event.is_set():
+                    return
+                _send_char(settings, draft_char)
+                draft_delay = random.uniform(min_delay, max_delay)
+                if draft_char.isalpha():
+                    draft_delay += random.uniform(0.01, 0.03)
+                if typing_mood is not None:
+                    draft_delay *= typing_mood.step()[0]
+                if enable_fatigue:
+                    draft_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
+                    fatigue_chars += 1
+                paced_sleep(draft_delay)
+            if not _run_select_retype(settings, select_edit, min_delay, max_delay):
+                return
+            left_skip_until = select_edit["end"]
+            state.chars_typed += select_edit["end"] - idx
+            prev_char = select_edit["original"][-1]
+            recent_typed_buffer = (recent_typed_buffer + select_edit["original"])[-120:]
+            continue
+
+        # --------------------------------
+        # TYPOS: adjacent-key errors, or expanded realistic typo types
+        # (swapped letters, doubled letters, missed spaces) when enabled.
+        # --------------------------------
+        char_already_typed = False
+        typo_corrected = False
+        if enable_typos and not is_protected and idx not in left_mistake_map:
+            can_typo = char.isalpha() or (use_extra_typos and char == " ")
+            if can_typo and random.uniform(0, 100) < min(100.0, typo_chance * zone_weight):
+                if (enable_capital_slips
+                        and _capital_slip_possible(text, idx, protection_mask)
+                        and random.random() < CAPITAL_SLIP_SHARE):
+                    # Capital letter slip (Update #44): takes the place of one
+                    # regular typo, so the typo count does not change.
+                    _simulate_capital_slip_typo(
+                        settings, char, text, idx, protection_mask, use_extra_typos
+                    )
+                    typo_corrected = True
+                elif not use_extra_typos:
+                    if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
+                        _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, False)
+                        typo_corrected = True
+                else:
+                    candidates = []
+                    if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
+                        candidates.append("adjacent")
+                    if (char.isalpha()
+                            and idx < len(text) - 1
+                            and text[idx + 1].isalpha()
+                            and not protection_mask[idx + 1]
+                            and char != text[idx + 1]):
+                        candidates.append("swap")
+                    if char.isalpha() and idx not in format_map:
+                        # (not at a format shortcut: the doubled letter stays on screen)
+                        candidates.append("double")
+                    if (char == " "
+                            and idx > 0 and text[idx - 1].isalpha()
+                            and idx + 1 < len(text) and text[idx + 1].isalpha()
+                            and not protection_mask[idx + 1]):
+                        candidates.append("missed_space")
+
+                    if candidates:
+                        chosen_typo = random.choice(candidates)
+                        if chosen_typo == "adjacent":
+                            _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, True)
+                        elif chosen_typo == "swap":
+                            _simulate_swapped_letter_typo(settings, text, idx, protection_mask)
+                        elif chosen_typo == "double":
+                            char_already_typed = _simulate_doubled_letter_typo(settings, text, idx, protection_mask)
+                        elif chosen_typo == "missed_space":
+                            _simulate_missed_space_typo(settings, text, idx, protection_mask)
+                        typo_corrected = True
+
+        if stop_event.is_set():
+            if char_already_typed:
+                state.chars_typed += 1  # the intended letter is already on screen
+            return
+
+        # --------------------------------
+        # OVERSHOOT (Update #35)
+        # Right after a typo was backspaced away, the typist sometimes presses
+        # Backspace one time too many, then types that letter again. Only the one
+        # letter right before the cursor is touched, and only a plain letter this
+        # run typed itself (the rework buffer holds exactly what is on screen).
+        # Skipped next to bold or italic shortcuts and while a second revision
+        # word is waiting.
+        # --------------------------------
+        if (typo_corrected and enable_overshoot and overshoot_chance > 0
+                and not char_already_typed
+                and idx - 1 >= resume_from
+                and not rework_hold
+                and not active_formats
+                and idx not in format_map and (idx - 1) not in format_map
+                and state.lookback_pending is None
+                and recent_typed_buffer and recent_typed_buffer[-1].isalpha()
+                and random.uniform(0, 100) < overshoot_chance):
+            if not _run_overshoot(settings, recent_typed_buffer[-1]):
+                return
+
+        # --------------------------------
+        # LETTER-PAIR SPEED-UP + BASE DELAY
+        # --------------------------------
+        current_pair = (prev_char + char).lower()
+        if current_pair in COMMON_PAIRS:
+            delay = random.uniform(0.02, 0.05)
+        else:
+            delay = random.uniform(min_delay, max_delay)
+            if char.isalpha():
+                delay += random.uniform(0.01, 0.03)
+            if enable_finger_timing:
+                # Update #28: opposite hands a little faster, same finger a little slower
+                delay *= get_finger_timing_multiplier(prev_char, char)
+
+        if typing_mood is not None:
+            # Update #31: flow makes the key quicker, hesitation slower (before fatigue)
+            mood_multiplier, mood_started = typing_mood.step()
+            delay *= mood_multiplier
+            if mood_started in (MOOD_FLOW, MOOD_HESITANT):
+                log_event("typing_mood", f"{mood_started} from character {idx}")
+
+        rhythm_kind = rhythm_plan.get(idx)
+        if rhythm_kind is not None:
+            # Update #40: familiar text a little quicker; names, technical terms,
+            # punctuation, and hedged claims a little slower (before fatigue)
+            delay *= rhythm_multipliers[rhythm_kind]
+
+        if essay_pace_on and not protection_mask[idx]:
+            # Update #42: slower opening and closing, quicker body (before fatigue)
+            delay *= get_essay_pace_multiplier(idx, len(text), essay_pace_strength)
+
+        if warm_up is not None:
+            # Update #45: the first keys after a long break are a little slower and
+            # ease back to normal. Protected text types at the normal speed, but
+            # it still counts toward the warm-up (before fatigue).
+            warm_up_multiplier = warm_up.step()
+            if not protection_mask[idx]:
+                delay *= warm_up_multiplier
+
+        if enable_fatigue:
+            delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
+            fatigue_chars += 1
+
+        left_entry = left_mistake_map.get(idx)
+
+        # --------------------------------
+        # FORMATTING MARKERS ([[b]] / [[i]], Update #29)
+        # Pressed right before the character is typed, AFTER any typo or
+        # slip has been typed and backspaced. That order matters: backspacing
+        # the first character after a shortcut could drop the style. The
+        # rework buffer is cleared so a rework never reaches back across a
+        # style change.
+        # --------------------------------
+        format_kinds = format_map.get(idx)
+        if format_kinds:
+            if not _press_format_toggles(settings, format_kinds, active_formats):
+                return
+            recent_typed_buffer = ""
+
+        held_seconds = 0.0
+        if left_entry is not None:
+            # Purposely left mistake: type the wrong text instead of this
+            # character (and skip any extra character it replaces).
+            _type_left_mistake(settings, left_entry, input_path)
+            left_skip_until = left_entry["end"]
+            state.chars_typed += left_entry["end"] - idx - 1
+            rework_hold = True
+            recent_typed_buffer = ""
+        elif not char_already_typed:
+            # Update #59: with overlap on, a quick pair of letters typed by
+            # opposite hands may leave this key down until the next one goes
+            # down. Spots with a shortcut, pause marker, or left mistake next
+            # never overlap, so nothing sits between the two keys.
+            keep_key_down = False
+            if (key_overlap_on and idx + 1 < len(text)
+                    and (idx + 1) not in format_map
+                    and (idx + 1) not in pause_map
+                    and (idx + 1) not in left_mistake_map):
+                keep_key_down = should_overlap_keys(char, text[idx + 1], delay, key_overlap_chance)
+            held_seconds = _send_char(settings, char, allow_overlap=key_overlap_on, keep_down=keep_key_down)
+        state.chars_typed += 1
+        if left_entry is not None:
+            pass  # the rework buffer was already cleared above
+        elif char == "\n":
+            state.newlines_typed += 1
+            recent_typed_buffer = ""
+            rework_hold = False
+        elif is_protected:
+            # Never let a rework reach into or across protected text
+            recent_typed_buffer = ""
+        else:
+            recent_typed_buffer += char
+            if len(recent_typed_buffer) > 120:
+                recent_typed_buffer = recent_typed_buffer[-120:]
+            if rework_hold and char == " ":
+                # First word break after a left mistake: start a fresh
+                # buffer so reworks only ever redo whole, untouched words.
+                recent_typed_buffer = ""
+                rework_hold = False
+
+        # AUTOSAVE CHECKPOINT: after a settled sentence-end position.
+        # Newlines and sentence-enders are points where no typo, rework, or
+        # paraphrase is partially done, so they are safe to resume from.
+        # We skip this in preview mode (never touch resume state there).
+        if (not settings.get("preview_mode")
+                and state.lookback_pending is None
+                and char in (".", "!", "?", "\n")
+                and time.time() - last_autosave_time >= 5.0):
+            autosave_idx = idx + 1  # characters typed through this index
+            autosave_hash = hash_clean_prefix(text, autosave_idx)
+            save_resume_state(input_path, autosave_idx, len(text), autosave_hash)
+            last_autosave_time = time.time()
+
+        prev_char = char
+        # Update #59: the time a key was held counts as part of the gap, so
+        # the typing speed stays the same with Key Press Timing on.
+        paced_sleep(max(0.0, delay - held_seconds))
+
+        if char == ",":
+            # A writing habit (Update #41) may make this writer quicker or
+            # slower on commas. The scale is 1.0 when habits are off.
+            paced_sleep(random.uniform(0.5, 1.5) * comma_pace_scale)
+        elif char in [";", ":"]:
+            paced_sleep(random.uniform(0.5, 1.5))
+        elif char in [".", "!", "?"]:
+            sentence_pause = random.uniform(sentence_pause_min, sentence_pause_max)
+            state.status = "Pausing after sentence..."
+            for _ in range(int(sentence_pause * 10)):
+                if stop_event.is_set() or pause_event.is_set():
+                    break
+                paced_sleep(0.1)
+            if stop_event.is_set():
+                return
+            if not pause_event.is_set():
+                state.status = "Typing..."
+                note_warm_up(sentence_pause, "a long sentence pause", idx + 1)
+
+    # The last paragraph has no line break after it, so its second revision
+    # pass (if any) happens here, after the last character.
+    final_lookback = lookback_fixes.get(len(text))
+    if final_lookback is not None and final_lookback["swapped"]:
+        if not _run_lookback_fix(settings, final_lookback, min_delay, max_delay):
+            return
+
+    # Formatting shortcuts at the very end of the file (this includes the
+    # automatic close of any style left open) come after the last character.
+    trailing_format = format_map.get(len(text))
+    if trailing_format and not _press_format_toggles(settings, trailing_format, active_formats):
+        return
+
+    # A {{pause:N}} marker at the very end of the file waits after the last character.
+    trailing_pause = pause_map.get(len(text))
+    if trailing_pause:
+        log_event("pause_marker", f"{trailing_pause:g}s after the last character")
+        if not _wait_for_pause_marker(trailing_pause):
+            return
+
+    # Check that what is on screen matches what was meant to be typed (Update #51).
+    run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path)
+    if stop_event.is_set():
+        return
+
+    log_event("session_end", "finished")
+    if is_last:
+        state.status = "Finished!"
+        run_on_main_thread(stop_typing)
+    else:
+        clear_resume_state(input_path)
+        if state.logging_enabled and state.log_entries:
+            export_log(auto=True)
+            state.log_entries = []
+
+
+# --------------------------------------------
+# GUI AND THREAD CONTROLS
+# --------------------------------------------
+def estimate_smart_fix_seconds(prepared, settings, start_index=0):
+    """Rough extra time for the smart fixes that will be acted out (typed
+    wrong, noticed, backspaced) from start_index onward. Each one costs
+    about a second, and only the 'Show fixes being noticed' share is acted out."""
+    chance = settings.get("smart_fix_visible_chance", 0.0)
+    if not prepared.fix_actions or chance <= 0:
+        return 0.0
+    acted_count = sum(len(acts) for index, acts in prepared.fix_actions.items() if index >= start_index)
+    return acted_count * (chance / 100.0) * 1.0
+
+
+def estimate_format_toggle_seconds(prepared, start_index=0):
+    """Rough time for the bold and italic shortcuts (Update #29) from
+    start_index onward. Each press takes about a third of a second."""
+    press_count = sum(len(kinds) for index, kinds in prepared.format_map.items() if index >= start_index)
+    return press_count * FORMAT_TOGGLE_ESTIMATE_SECONDS
+
+
+def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seconds=0.0, extra_seconds=0.0,
+                         essay_context=None):
+    """Rough estimate of total run time for the given text under the
+    given settings, using averages of the same ranges type_text()
+    actually draws from. This is an estimate, not a simulation --
+    randomness means an actual run will vary somewhat."""
+    char_count = len(text)
+    word_count = len([w for w in text.split() if w])
+
+    avg_delay = (settings["min_delay"] + settings["max_delay"]) / 2 + 0.015
+    total_seconds = char_count * avg_delay
+
+    other_punct_count = sum(text.count(c) for c in [",", ";", ":"])
+    total_seconds += other_punct_count * 1.0  # avg of the fixed 0.5-1.5s pause
+
+    sentence_ender_count = sum(text.count(c) for c in [".", "!", "?"])
+    avg_sentence_pause = (settings["sentence_pause_min"] + settings["sentence_pause_max"]) / 2
+    total_seconds += sentence_ender_count * avg_sentence_pause
+
+    newline_count = text.count("\n")
+    avg_paragraph_pause = (settings["paragraph_pause_min"] + settings["paragraph_pause_max"]) / 2
+    total_seconds += newline_count * avg_paragraph_pause
+
+    if settings["enable_breaks"] and settings["break_min"] and settings["break_max"]:
+        avg_break_interval = (settings["break_min"] + settings["break_max"]) / 2
+        avg_break_duration = (settings["break_duration_min"] + settings["break_duration_max"]) / 2
+        estimated_breaks = newline_count / avg_break_interval if avg_break_interval > 0 else 0
+        total_seconds += estimated_breaks * avg_break_duration
+
+    if settings["enable_mistakes"] and settings["mistake_min"] and settings["mistake_max"]:
+        avg_mistake_interval = (settings["mistake_min"] + settings["mistake_max"]) / 2
+        estimated_reworks = word_count / avg_mistake_interval if avg_mistake_interval > 0 else 0
+        total_seconds += estimated_reworks * 3.5  # rough overhead per rework, pauses + retyping
+
+    if settings["enable_typos"] and settings["typo_chance"] > 0:
+        if protection_mask is not None:
+            alpha_count = sum(1 for i, c in enumerate(text) if c.isalpha() and not protection_mask[i])
+        else:
+            alpha_count = sum(1 for c in text if c.isalpha())
+        estimated_typos = alpha_count * (settings["typo_chance"] / 100)
+        overhead = 0.7 if settings.get("use_extra_typos") else 0.25
+        total_seconds += estimated_typos * overhead
+
+    if settings.get("enable_paraphrase") and settings.get("paraphrase_chance", 0) > 0:
+        estimated_paraphrases = newline_count * (settings["paraphrase_chance"] / 100)
+        total_seconds += estimated_paraphrases * 4.0
+
+    if settings.get("enable_lookback_edit") and settings.get("lookback_edit_chance", 0) > 0:
+        # Second revision pass (Update #34): rough time for each trip back and forth
+        paragraph_count = newline_count + (1 if text and not text.endswith("\n") else 0)
+        total_seconds += paragraph_count * (settings["lookback_edit_chance"] / 100) * LOOKBACK_ESTIMATE_SECONDS
+
+    if settings.get("enable_select_retype") and settings.get("select_retype_chance", 0) > 0:
+        # Select and retype (Update #35): rough time for each one
+        paragraph_count = newline_count + (1 if text and not text.endswith("\n") else 0)
+        total_seconds += paragraph_count * (settings["select_retype_chance"] / 100) * SELECT_RETYPE_ESTIMATE_SECONDS
+
+    if (settings.get("enable_overshoot", True) and settings.get("overshoot_chance", 0) > 0
+            and settings["enable_typos"] and settings["typo_chance"] > 0):
+        # Overshoot (Update #35): only happens after a typo is fixed
+        if protection_mask is not None:
+            overshoot_alpha = sum(1 for i, c in enumerate(text) if c.isalpha() and not protection_mask[i])
+        else:
+            overshoot_alpha = sum(1 for c in text if c.isalpha())
+        overshoot_typos = overshoot_alpha * (settings["typo_chance"] / 100)
+        total_seconds += overshoot_typos * (settings["overshoot_chance"] / 100) * OVERSHOOT_ESTIMATE_SECONDS
+
+    if settings.get("enable_finger_timing", True):
+        # Finger and hand timing (Update #28): hand switches are a little faster and
+        # same-finger pairs a little slower. The shift is counted in average delays.
+        total_seconds += estimate_finger_timing_shift(text) * avg_delay
+
+    # Uneven rhythm (Update #40): familiar text quicker, names, technical terms,
+    # punctuation, and hedged claims slower. Counted in average delays.
+    total_seconds += estimate_rhythm_shift(text, protection_mask, settings) * avg_delay
+
+    # Thinking pauses on hard words and hard sentences (Update #33), averaged
+    # over the same chances and ranges the typing loop draws from.
+    total_seconds += estimate_difficulty_pause_seconds(text, protection_mask, settings)
+
+    # Short pauses between bursts of typing (Update #37), averaged the same way.
+    total_seconds += estimate_burst_pause_seconds(text, protection_mask, settings)
+
+    # Pauses at decision points (Update #38), averaged the same way.
+    total_seconds += estimate_decision_pause_seconds(text, protection_mask, settings)
+
+    # Writing habits (Update #41): pauses before headings, quotes, and asides,
+    # plus quicker or slower commas, averaged the same way.
+    total_seconds += estimate_writing_habit_seconds(text, protection_mask, settings)
+
+    # Essay pace (Update #42): slower opening and closing, quicker body, plus the
+    # opening and closing pauses. essay_context is (where this text starts in the
+    # whole file, length of the whole file); it is only given for a stretch.
+    essay_offset, essay_total = essay_context if essay_context else (0, len(text))
+    total_seconds += estimate_essay_pace_shift(text, protection_mask, settings, essay_offset, essay_total) * avg_delay
+    total_seconds += estimate_essay_pause_seconds(text, protection_mask, settings, essay_offset, essay_total)
+
+    # Warm-up after breaks (Update #45): the slower first keys after a long wait.
+    total_seconds += estimate_warmup_seconds(text, settings, avg_delay)
+
+    if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
+        # Fatigue drift approximate adjustment: as characters are typed, delays gradually
+        # increase up to fatigue_strength percent and partly recover after research breaks.
+        # Across a full session, the average per-character slowdown is approximately half
+        # of the maximum fatigue strength setting. (Note: this is an approximation).
+        fatigue_strength = settings["fatigue_strength"]
+        avg_fatigue_mult = 1.0 + (fatigue_strength / 200.0)
+        total_seconds += (char_count * avg_delay) * (avg_fatigue_mult - 1.0)
+
+    if settings.get("enable_typing_moods", True) and settings.get("typing_mood_strength", 100.0) > 0:
+        # Flow and hesitation states (Update #31): the average speed change over a
+        # long run (a small net number, since flow and hesitation roughly balance).
+        mood_shift = estimate_mood_multiplier(settings["typing_mood_strength"]) - 1.0
+        total_seconds += (char_count * avg_delay) * mood_shift
+
+    # Total of all inline {{pause:N}} markers still ahead (exact, not an average).
+    total_seconds += marker_pause_seconds
+
+    # Extra time for smart fixes that get acted out (see estimate_smart_fix_seconds).
+    total_seconds += extra_seconds
+
+    return word_count, char_count, total_seconds
+
+
+def parse_finite_float(text):
+    """Like float(), but refuses nan, inf, and -inf (it raises ValueError, which
+    every caller already turns into a plain "must be numbers" message). Those
+    values pass every "less than" check, and they would reach the typing delays."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError("not a finite number")
+    return number
+
+
+def validate_settings():
+    """Validate all numeric GUI inputs before a run starts. Returns
+    a populated settings dict on success, or None (after showing an
+    error) on failure."""
+    try:
+        min_delay = parse_finite_float(min_delay_var.get())
+        max_delay = parse_finite_float(max_delay_var.get())
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Min/Max delay must be numbers.")
+        return None
+    if min_delay < 0 or max_delay < 0:
+        messagebox.showerror("Invalid Input", "Delays cannot be negative.")
+        return None
+    if min_delay > max_delay:
+        messagebox.showerror("Invalid Input", "Min Delay cannot be greater than Max Delay.")
+        return None
+
+    try:
+        paragraph_pause_min = parse_finite_float(paragraph_pause_min_var.get())
+        paragraph_pause_max = parse_finite_float(paragraph_pause_max_var.get())
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Paragraph pause (seconds) must be numbers.")
+        return None
+    if paragraph_pause_min < 0 or paragraph_pause_max < 0:
+        messagebox.showerror("Invalid Input", "Paragraph pause cannot be negative.")
+        return None
+    if paragraph_pause_min > paragraph_pause_max:
+        messagebox.showerror("Invalid Input", "Min paragraph pause cannot exceed max paragraph pause.")
+        return None
+
+    try:
+        sentence_pause_min = parse_finite_float(sentence_pause_min_var.get())
+        sentence_pause_max = parse_finite_float(sentence_pause_max_var.get())
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Sentence-end pause (seconds) must be numbers.")
+        return None
+    if sentence_pause_min < 0 or sentence_pause_max < 0:
+        messagebox.showerror("Invalid Input", "Sentence-end pause cannot be negative.")
+        return None
+    if sentence_pause_min > sentence_pause_max:
+        messagebox.showerror("Invalid Input", "Min sentence-end pause cannot exceed max sentence-end pause.")
+        return None
+
+    enable_mistakes = enable_mistakes_var.get()
+    mistake_min = mistake_max = 0
+    if enable_mistakes:
+        try:
+            mistake_min = int(mistake_min_var.get())
+            mistake_max = int(mistake_max_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Mistake frequency (words) must be whole numbers.")
+            return None
+        if mistake_min < 1 or mistake_max < 1:
+            messagebox.showerror("Invalid Input", "Mistake frequency must be at least 1 word.")
+            return None
+        if mistake_min > mistake_max:
+            messagebox.showerror("Invalid Input", "Min mistake words cannot exceed max mistake words.")
+            return None
+
+    enable_breaks = enable_breaks_var.get()
+    break_min = break_max = 0
+    break_duration_min = break_duration_max = 0.0
+    if enable_breaks:
+        try:
+            break_min = int(break_min_var.get())
+            break_max = int(break_max_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Break frequency (paragraphs) must be whole numbers.")
+            return None
+        if break_min < 1 or break_max < 1:
+            messagebox.showerror("Invalid Input", "Break frequency must be at least 1 paragraph.")
+            return None
+        if break_min > break_max:
+            messagebox.showerror("Invalid Input", "Min break paragraphs cannot exceed max break paragraphs.")
+            return None
+
+        try:
+            break_duration_min = parse_finite_float(break_duration_min_var.get())
+            break_duration_max = parse_finite_float(break_duration_max_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Break duration (seconds) must be numbers.")
+            return None
+        if break_duration_min < 1 or break_duration_max < 1:
+            messagebox.showerror("Invalid Input", "Break duration must be at least 1 second.")
+            return None
+        if break_duration_min > break_duration_max:
+            messagebox.showerror("Invalid Input", "Min break duration cannot exceed max break duration.")
+            return None
+
+    queue_files = get_queue_files()
+    input_path = input_path_var.get().strip()
+    if not queue_files and not input_path:
+        messagebox.showerror("Invalid Input", "Please choose an input text file or add files to the queue.")
+        return None
+
+    enable_typos = enable_typos_var.get()
+    use_extra_typos = bool(use_extra_typos_var.get())
+    enable_capital_slips = bool(enable_capital_slips_var.get())
+    typo_chance = 0.0
+    if enable_typos:
+        try:
+            typo_chance = parse_finite_float(typo_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Typo chance must be a number.")
+            return None
+        if typo_chance < 0 or typo_chance > 100:
+            messagebox.showerror("Invalid Input", "Typo chance must be between 0 and 100.")
+            return None
+
+    enable_paraphrase = enable_paraphrase_var.get()
+    paraphrase_chance = 0.0
+    if enable_paraphrase:
+        try:
+            paraphrase_chance = parse_finite_float(paraphrase_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Paraphrase chance must be a number.")
+            return None
+        if paraphrase_chance < 0 or paraphrase_chance > 100:
+            messagebox.showerror("Invalid Input", "Paraphrase chance must be between 0 and 100.")
+            return None
+
+    enable_lookback_edit = bool(enable_lookback_edit_var.get())
+    lookback_edit_chance = 0.0
+    if enable_lookback_edit:
+        try:
+            lookback_edit_chance = parse_finite_float(lookback_edit_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Second revision chance must be a number.")
+            return None
+        if lookback_edit_chance < 0 or lookback_edit_chance > LOOKBACK_CHANCE_MAX:
+            messagebox.showerror("Invalid Input", "Second revision chance must be between 0 and 100.")
+            return None
+
+    enable_select_retype = bool(enable_select_retype_var.get())
+    select_retype_chance = 0.0
+    if enable_select_retype:
+        try:
+            select_retype_chance = parse_finite_float(select_retype_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Select and retype chance must be a number.")
+            return None
+        if select_retype_chance < 0 or select_retype_chance > SELECT_RETYPE_CHANCE_MAX:
+            messagebox.showerror("Invalid Input", "Select and retype chance must be between 0 and 100.")
+            return None
+
+    enable_overshoot = bool(enable_overshoot_var.get())
+    overshoot_chance = 0.0
+    if enable_overshoot:
+        try:
+            overshoot_chance = parse_finite_float(overshoot_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Overshoot chance must be a number.")
+            return None
+        if overshoot_chance < 0 or overshoot_chance > OVERSHOOT_CHANCE_MAX:
+            messagebox.showerror("Invalid Input", "Overshoot chance must be between 0 and 100.")
+            return None
+
+    # Real key press timing (Update #59). The hold times and the overlap chance
+    # are only checked when their feature is on, like the other boxes.
+    enable_key_hold = bool(enable_key_hold_var.get())
+    enable_shift_hold = bool(enable_shift_hold_var.get())
+    enable_key_overlap = enable_key_hold and bool(enable_key_overlap_var.get())
+    key_hold_min_ms = KEY_HOLD_MIN_MS_DEFAULT
+    key_hold_max_ms = KEY_HOLD_MAX_MS_DEFAULT
+    key_overlap_chance = 0.0
+    if enable_key_hold:
+        try:
+            key_hold_min_ms = parse_finite_float(key_hold_min_ms_var.get())
+            key_hold_max_ms = parse_finite_float(key_hold_max_ms_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Key hold times must be numbers (in milliseconds).")
+            return None
+        if key_hold_min_ms < KEY_HOLD_LIMIT_MIN_MS or key_hold_max_ms > KEY_HOLD_LIMIT_MAX_MS:
+            messagebox.showerror(
+                "Invalid Input",
+                f"Key hold times must be between {KEY_HOLD_LIMIT_MIN_MS:g} and {KEY_HOLD_LIMIT_MAX_MS:g} milliseconds.",
+            )
+            return None
+        if key_hold_min_ms > key_hold_max_ms:
+            messagebox.showerror("Invalid Input", "The shortest key hold time cannot be longer than the longest.")
+            return None
+        if enable_key_overlap:
+            try:
+                key_overlap_chance = parse_finite_float(key_overlap_chance_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid Input", "Key overlap chance must be a number.")
+                return None
+            if key_overlap_chance < 0 or key_overlap_chance > KEY_OVERLAP_CHANCE_MAX:
+                messagebox.showerror("Invalid Input", "Key overlap chance must be between 0 and 100.")
+                return None
+
+    locked_window = window_var.get().strip() if lock_window_var.get() else ""
+
+    # Auto Profile by Window (Update #30). The rules are cleaned on the way in,
+    # so anything malformed has already been dropped.
+    enable_auto_profile = bool(enable_auto_profile_var.get())
+    auto_profile_rules = get_auto_profile_rules()
+
+    auto_pause_activity = auto_pause_activity_var.get()
+    # Auto-pause alert (Update #54): on or off.
+    alert_on_auto_pause = bool(alert_on_auto_pause_var.get())
+    try:
+        activity_sensitivity = parse_finite_float(activity_sensitivity_var.get())
+        if activity_sensitivity < 5 or activity_sensitivity > 500:
+            activity_sensitivity = 20.0
+            activity_sensitivity_var.set("20")
+    except ValueError:
+        activity_sensitivity = 20.0
+        activity_sensitivity_var.set("20")
+
+    enable_fatigue = enable_fatigue_var.get()
+    try:
+        fatigue_strength = parse_finite_float(fatigue_strength_var.get())
+        if fatigue_strength < 0:
+            fatigue_strength = 0.0
+            fatigue_strength_var.set("0")
+        elif fatigue_strength > 40:
+            fatigue_strength = 40.0
+            fatigue_strength_var.set("40")
+    except ValueError:
+        fatigue_strength = 15.0
+        fatigue_strength_var.set("15")
+
+    enable_finger_timing = bool(enable_finger_timing_var.get())
+    enable_typing_moods = bool(enable_typing_moods_var.get())
+    try:
+        typing_mood_strength = parse_finite_float(typing_mood_strength_var.get())
+        if typing_mood_strength < 0:
+            typing_mood_strength = 0.0
+            typing_mood_strength_var.set("0")
+        elif typing_mood_strength > MOOD_STRENGTH_MAX:
+            typing_mood_strength = MOOD_STRENGTH_MAX
+            typing_mood_strength_var.set(f"{MOOD_STRENGTH_MAX:g}")
+    except ValueError:
+        typing_mood_strength = 100.0
+        typing_mood_strength_var.set("100")
+    enable_difficulty_pauses = bool(enable_difficulty_pauses_var.get())
+    try:
+        difficulty_pause_strength = parse_finite_float(difficulty_pause_strength_var.get())
+        if difficulty_pause_strength < 0:
+            difficulty_pause_strength = 0.0
+            difficulty_pause_strength_var.set("0")
+        elif difficulty_pause_strength > DIFFICULTY_STRENGTH_MAX:
+            difficulty_pause_strength = DIFFICULTY_STRENGTH_MAX
+            difficulty_pause_strength_var.set(f"{DIFFICULTY_STRENGTH_MAX:g}")
+    except ValueError:
+        difficulty_pause_strength = 100.0
+        difficulty_pause_strength_var.set("100")
+    enable_typing_bursts = bool(enable_typing_bursts_var.get())
+    try:
+        burst_pause_strength = parse_finite_float(burst_pause_strength_var.get())
+        if burst_pause_strength < 0:
+            burst_pause_strength = 0.0
+            burst_pause_strength_var.set("0")
+        elif burst_pause_strength > BURST_STRENGTH_MAX:
+            burst_pause_strength = BURST_STRENGTH_MAX
+            burst_pause_strength_var.set(f"{BURST_STRENGTH_MAX:g}")
+    except ValueError:
+        burst_pause_strength = 100.0
+        burst_pause_strength_var.set("100")
+    enable_decision_pauses = bool(enable_decision_pauses_var.get())
+    try:
+        decision_pause_strength = parse_finite_float(decision_pause_strength_var.get())
+        if decision_pause_strength < 0:
+            decision_pause_strength = 0.0
+            decision_pause_strength_var.set("0")
+        elif decision_pause_strength > DECISION_STRENGTH_MAX:
+            decision_pause_strength = DECISION_STRENGTH_MAX
+            decision_pause_strength_var.set(f"{DECISION_STRENGTH_MAX:g}")
+    except ValueError:
+        decision_pause_strength = 100.0
+        decision_pause_strength_var.set("100")
+    enable_uneven_rhythm = bool(enable_uneven_rhythm_var.get())
+    try:
+        rhythm_strength = parse_finite_float(rhythm_strength_var.get())
+        if rhythm_strength < 0:
+            rhythm_strength = 0.0
+            rhythm_strength_var.set("0")
+        elif rhythm_strength > RHYTHM_STRENGTH_MAX:
+            rhythm_strength = RHYTHM_STRENGTH_MAX
+            rhythm_strength_var.set(f"{RHYTHM_STRENGTH_MAX:g}")
+    except ValueError:
+        rhythm_strength = 100.0
+        rhythm_strength_var.set("100")
+    enable_writing_habits = bool(enable_writing_habits_var.get())
+    try:
+        writing_habit_strength = parse_finite_float(writing_habit_strength_var.get())
+        if not (writing_habit_strength >= 0):  # also catches NaN
+            writing_habit_strength = 0.0
+            writing_habit_strength_var.set("0")
+        elif writing_habit_strength > HABIT_STRENGTH_MAX:
+            writing_habit_strength = HABIT_STRENGTH_MAX
+            writing_habit_strength_var.set(f"{HABIT_STRENGTH_MAX:g}")
+    except ValueError:
+        writing_habit_strength = 100.0
+        writing_habit_strength_var.set("100")
+    enable_essay_pace = bool(enable_essay_pace_var.get())
+    try:
+        essay_pace_strength = parse_finite_float(essay_pace_strength_var.get())
+        if not (essay_pace_strength >= 0):  # also catches NaN
+            essay_pace_strength = 0.0
+            essay_pace_strength_var.set("0")
+        elif essay_pace_strength > ESSAY_STRENGTH_MAX:
+            essay_pace_strength = ESSAY_STRENGTH_MAX
+            essay_pace_strength_var.set(f"{ESSAY_STRENGTH_MAX:g}")
+    except ValueError:
+        essay_pace_strength = 100.0
+        essay_pace_strength_var.set("100")
+    enable_warmup = bool(enable_warmup_var.get())
+    try:
+        warmup_strength = parse_finite_float(warmup_strength_var.get())
+        if not (warmup_strength >= 0):  # also catches NaN
+            warmup_strength = 0.0
+            warmup_strength_var.set("0")
+        elif warmup_strength > WARMUP_STRENGTH_MAX:
+            warmup_strength = WARMUP_STRENGTH_MAX
+            warmup_strength_var.set(f"{WARMUP_STRENGTH_MAX:g}")
+    except ValueError:
+        warmup_strength = 100.0
+        warmup_strength_var.set("100")
+    # Start countdown (Update #43): whole seconds from 0 to 60. A box that cannot
+    # be read as a number goes back to the default, and out-of-range values are
+    # pulled back into range, with the box corrected to match.
+    start_countdown_seconds = clamp_start_countdown(start_countdown_seconds_var.get())
+    if start_countdown_seconds_var.get().strip() != str(start_countdown_seconds):
+        start_countdown_seconds_var.set(str(start_countdown_seconds))
+    # Scheduled start (Update #46): the time must be readable when the box is
+    # checked. While it is unchecked, a bad time just goes back to the default so
+    # it never blocks a normal run or a preview.
+    enable_scheduled_start = bool(enable_scheduled_start_var.get())
+    scheduled_clock = parse_clock_time(scheduled_start_time_var.get())
+    if scheduled_clock is None:
+        if enable_scheduled_start:
+            messagebox.showerror(
+                "Invalid Start Time",
+                "The scheduled start time could not be read.\n\n"
+                "Type a clock time such as 3:30 PM or 15:30 on the Window tab.",
+            )
+            return None
+        scheduled_start_time = SCHEDULED_START_DEFAULT
+    else:
+        scheduled_start_time = format_clock_time(scheduled_clock[0], scheduled_clock[1])
+    if scheduled_start_time_var.get() != scheduled_start_time:
+        scheduled_start_time_var.set(scheduled_start_time)
+    enable_revision_clusters = bool(enable_revision_clusters_var.get())
+    try:
+        cluster_strength = parse_finite_float(cluster_strength_var.get())
+        if not math.isfinite(cluster_strength):
+            raise ValueError("not a finite number")
+        if cluster_strength < 0:
+            cluster_strength = 0.0
+            cluster_strength_var.set("0")
+        elif cluster_strength > CLUSTER_STRENGTH_MAX:
+            cluster_strength = CLUSTER_STRENGTH_MAX
+            cluster_strength_var.set(f"{CLUSTER_STRENGTH_MAX:g}")
+    except ValueError:
+        cluster_strength = 100.0
+        cluster_strength_var.set("100")
+    revision_style = normalize_cluster_style(revision_style_var.get())
+    if revision_style_var.get() != revision_style:
+        revision_style_var.set(revision_style)
+    editor_mode = normalize_editor_mode(editor_mode_var.get())
+    if editor_mode_var.get() != editor_mode:
+        editor_mode_var.set(editor_mode)
+    enable_pause_markers = bool(enable_pause_markers_var.get())
+    enable_format_markers = bool(enable_format_markers_var.get())
+
+    enable_smart_fixes = bool(enable_smart_fixes_var.get())
+    smart_fix_spacing = bool(smart_fix_spacing_var.get())
+    smart_fix_punctuation = bool(smart_fix_punctuation_var.get())
+    smart_fix_capitalization = bool(smart_fix_capitalization_var.get())
+    smart_fix_repeated_words = bool(smart_fix_repeated_words_var.get())
+    try:
+        smart_fix_visible_chance = parse_finite_float(smart_fix_visible_chance_var.get())
+        if not (smart_fix_visible_chance >= 0):  # also catches NaN
+            smart_fix_visible_chance = 0.0
+            smart_fix_visible_chance_var.set("0")
+        elif smart_fix_visible_chance > 100:
+            smart_fix_visible_chance = 100.0
+            smart_fix_visible_chance_var.set("100")
+    except ValueError:
+        smart_fix_visible_chance = 50.0
+        smart_fix_visible_chance_var.set("50")
+
+    enable_leave_mistakes = bool(enable_leave_mistakes_var.get())
+    leave_mistakes_typos = bool(leave_mistakes_typos_var.get())
+    leave_mistakes_commas = bool(leave_mistakes_commas_var.get())
+    leave_mistakes_punctuation = bool(leave_mistakes_punctuation_var.get())
+    try:
+        leave_mistake_count = int(leave_mistake_count_var.get())
+        if leave_mistake_count < 1:
+            leave_mistake_count = 1
+            leave_mistake_count_var.set("1")
+        elif leave_mistake_count > LEFT_MISTAKE_MAX_COUNT:
+            leave_mistake_count = LEFT_MISTAKE_MAX_COUNT
+            leave_mistake_count_var.set(str(LEFT_MISTAKE_MAX_COUNT))
+    except ValueError:
+        leave_mistake_count = LEFT_MISTAKE_DEFAULT_COUNT
+        leave_mistake_count_var.set(str(LEFT_MISTAKE_DEFAULT_COUNT))
+    if enable_leave_mistakes and not (
+        leave_mistakes_typos or leave_mistakes_commas or leave_mistakes_punctuation
+    ):
+        messagebox.showerror(
+            "Invalid Input",
+            "Turn on at least one kind of mistake to leave (typos, commas, or punctuation), "
+            "or turn off 'Leave some mistakes for me to fix'.",
+        )
+        return None
+
+    enable_target_time = bool(enable_target_time_var.get())
+    target_seconds = 0.0
+    if enable_target_time:
+        try:
+            target_hours = int(target_hours_var.get())
+            target_minutes = int(target_minutes_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Target time hours and minutes must be whole numbers.")
+            return None
+        if target_hours < 0 or target_minutes < 0 or target_minutes > 59:
+            messagebox.showerror(
+                "Invalid Input",
+                "Target time hours cannot be negative, and minutes must be between 0 and 59.",
+            )
+            return None
+        if target_hours > TARGET_TIME_MAX_HOURS:
+            messagebox.showerror(
+                "Invalid Input",
+                f"Target time cannot be longer than {TARGET_TIME_MAX_HOURS} hours.",
+            )
+            return None
+        target_seconds = float(target_hours * 3600 + target_minutes * 60)
+        if target_seconds < TARGET_TIME_MIN_SECONDS or target_seconds > TARGET_TIME_MAX_HOURS * 3600:
+            messagebox.showerror(
+                "Invalid Input",
+                f"Target time must be between 1 minute and {TARGET_TIME_MAX_HOURS} hours.",
+            )
+            return None
+
+    enable_update_check = bool(enable_update_check_var.get())
+    skipped_update_version = skipped_update_version_var.get().strip()
+    if skipped_update_version and parse_version_text(skipped_update_version) is None:
+        skipped_update_version = ""
+        skipped_update_version_var.set("")
+
+    theme = theme_var.get().strip().lower()
+    if theme not in ("light", "dark"):
+        theme = "light"
+
+    # Check typed text (Update #51): on or off.
+    check_typed_text = bool(check_typed_text_var.get())
+
+    # App text size (Update #48): only the allowed choices. A box that cannot be
+    # read goes back to 100%, and a number between choices snaps to the nearest.
+    text_size_percent = clamp_text_size_percent(text_size_percent_var.get())
+    if text_size_percent_var.get() != f"{text_size_percent}%":
+        text_size_percent_var.set(f"{text_size_percent}%")
+
+    # Preview speed (Update #53): only the allowed choices. A box that cannot be
+    # read goes back to 1x, and a number between choices snaps to the nearest.
+    preview_speed = clamp_preview_speed(preview_speed_var.get())
+    if preview_speed_var.get() != preview_speed_label(preview_speed):
+        preview_speed_var.set(preview_speed_label(preview_speed))
+
+    return {
+        "input_path": input_path if not queue_files else queue_files[0],
+        "file_queue": queue_files,
+        "min_delay": min_delay,
+        "max_delay": max_delay,
+        "mistake_min": mistake_min,
+        "mistake_max": mistake_max,
+        "break_min": break_min,
+        "break_max": break_max,
+        "break_duration_min": break_duration_min,
+        "break_duration_max": break_duration_max,
+        "enable_mistakes": enable_mistakes,
+        "enable_breaks": enable_breaks,
+        "locked_window": locked_window,
+        "enable_auto_profile": enable_auto_profile,
+        "auto_profile_rules": auto_profile_rules,
+        "auto_pause_activity": auto_pause_activity,
+        "alert_on_auto_pause": alert_on_auto_pause,
+        "activity_sensitivity": activity_sensitivity,
+        "enable_fatigue": enable_fatigue,
+        "fatigue_strength": fatigue_strength,
+        "enable_finger_timing": enable_finger_timing,
+        "enable_typing_moods": enable_typing_moods,
+        "typing_mood_strength": typing_mood_strength,
+        "enable_difficulty_pauses": enable_difficulty_pauses,
+        "difficulty_pause_strength": difficulty_pause_strength,
+        "enable_typing_bursts": enable_typing_bursts,
+        "burst_pause_strength": burst_pause_strength,
+        "enable_decision_pauses": enable_decision_pauses,
+        "decision_pause_strength": decision_pause_strength,
+        "enable_uneven_rhythm": enable_uneven_rhythm,
+        "rhythm_strength": rhythm_strength,
+        "enable_writing_habits": enable_writing_habits,
+        "writing_habit_strength": writing_habit_strength,
+        "enable_essay_pace": enable_essay_pace,
+        "essay_pace_strength": essay_pace_strength,
+        "enable_warmup": enable_warmup,
+        "warmup_strength": warmup_strength,
+        "start_countdown_seconds": start_countdown_seconds,
+        "enable_scheduled_start": enable_scheduled_start,
+        "scheduled_start_time": scheduled_start_time,
+        "enable_revision_clusters": enable_revision_clusters,
+        "cluster_strength": cluster_strength,
+        "revision_style": revision_style,
+        "editor_mode": editor_mode,
+        "enable_target_time": enable_target_time,
+        "target_seconds": target_seconds,
+        "enable_pause_markers": enable_pause_markers,
+        "enable_format_markers": enable_format_markers,
+        "enable_smart_fixes": enable_smart_fixes,
+        "smart_fix_spacing": smart_fix_spacing,
+        "smart_fix_punctuation": smart_fix_punctuation,
+        "smart_fix_capitalization": smart_fix_capitalization,
+        "smart_fix_repeated_words": smart_fix_repeated_words,
+        "smart_fix_visible_chance": smart_fix_visible_chance,
+        "enable_leave_mistakes": enable_leave_mistakes,
+        "leave_mistake_count": leave_mistake_count,
+        "leave_mistakes_typos": leave_mistakes_typos,
+        "leave_mistakes_commas": leave_mistakes_commas,
+        "leave_mistakes_punctuation": leave_mistakes_punctuation,
+        "enable_update_check": enable_update_check,
+        "skipped_update_version": skipped_update_version,
+        "enable_typos": enable_typos,
+        "typo_chance": typo_chance,
+        "use_extra_typos": use_extra_typos,
+        "enable_capital_slips": enable_capital_slips,
+        "enable_paraphrase": enable_paraphrase,
+        "paraphrase_chance": paraphrase_chance,
+        "enable_lookback_edit": enable_lookback_edit,
+        "lookback_edit_chance": lookback_edit_chance,
+        "enable_select_retype": enable_select_retype,
+        "select_retype_chance": select_retype_chance,
+        "enable_overshoot": enable_overshoot,
+        "overshoot_chance": overshoot_chance,
+        "enable_key_hold": enable_key_hold,
+        "key_hold_min_ms": key_hold_min_ms,
+        "key_hold_max_ms": key_hold_max_ms,
+        "enable_shift_hold": enable_shift_hold,
+        "enable_key_overlap": enable_key_overlap,
+        "key_overlap_chance": key_overlap_chance,
+        "paragraph_pause_min": paragraph_pause_min,
+        "paragraph_pause_max": paragraph_pause_max,
+        "sentence_pause_min": sentence_pause_min,
+        "sentence_pause_max": sentence_pause_max,
+        "theme": theme,
+        "text_size_percent": text_size_percent,
+        "check_typed_text": check_typed_text,
+        "preview_speed": preview_speed,
+    }
+
+
+TARGET_TIME_TOO_SHORT_FACTOR = 1.05  # typing estimate over the target by more than 5% counts as too short
+
+
+def describe_target_time_plan(settings, estimated_seconds):
+    """A short phrase for the pre-start estimate that says what the target
+    time will do. Returns an empty string when no target time is set."""
+    if not settings.get("enable_target_time"):
+        return ""
+    target = settings.get("target_seconds", 0.0)
+    target_text = format_duration_text(target)
+    if estimated_seconds > target * TARGET_TIME_TOO_SHORT_FACTOR:
+        return f" \u2022 Target {target_text} is shorter than the typing time, so it cannot be reached"
+    spare_seconds = target - estimated_seconds
+    break_count = plan_session_break_count(spare_seconds)
+    if break_count == 0:
+        return f" \u2022 Target {target_text}: no long breaks needed"
+    return (
+        f" \u2022 Target {target_text}: about {format_duration_text(spare_seconds)} "
+        f"of long breaks (~{break_count} breaks)"
+    )
+
+
+def estimate_total_active_seconds(files, settings):
+    """Rough typing time (without session breaks) for the text still to be
+    typed in `files`, counting from any saved resume point. Returns None when a
+    file cannot be read; type_text() reports unreadable files itself."""
+    total_seconds = 0.0
+    for fpath in files:
+        try:
+            raw_text = read_input_file_text(fpath)
+        except OSError:
+            return None
+        if not raw_text:
+            continue
+        prepared = prepare_input_text(raw_text, settings)
+        text = prepared.clean_text
+        protection_mask = build_protection_mask(len(text), prepared.protected_ranges)
+        resume_chars = load_resume_state_for(fpath) or 0
+        total_seconds += estimate_active_seconds(
+            text, settings, protection_mask, prepared.pause_map, resume_chars, len(text)
+        )
+        total_seconds += estimate_smart_fix_seconds(prepared, settings, resume_chars)
+        total_seconds += estimate_format_toggle_seconds(prepared, resume_chars)
+    return total_seconds
+
+
+def confirm_target_time_plan(files, settings):
+    """When a target time is set but is shorter than the estimated typing time,
+    says so BEFORE typing starts, because the target cannot be reached.
+    Returns True if it is OK to start, False if the person chose to change
+    the settings first."""
+    if not settings.get("enable_target_time"):
+        return True
+    estimated_seconds = estimate_total_active_seconds(files, settings)
+    if estimated_seconds is None:
+        return True  # unreadable files are reported when typing starts
+    target = settings.get("target_seconds", 0.0)
+    if estimated_seconds <= target * TARGET_TIME_TOO_SHORT_FACTOR:
+        return True
+    return messagebox.askokcancel(
+        "Target Time Too Short",
+        f"Your target time is {format_duration_text(target)}, but typing this text with your "
+        f"current speed and pause settings is estimated to take about "
+        f"{format_duration_text(estimated_seconds)}.\n\n"
+        "Amanuensis never types faster than your speed settings, so no long breaks will be "
+        "added and the run will take about the estimated time.\n\n"
+        "Click OK to start anyway, or Cancel to raise the target time or speed up your "
+        "typing settings first.",
+    )
+
+
+def preview_estimate():
+    """Reads the current input file(s) and settings (reusing the same
+    validation as an actual run) and shows a word count and rough
+    total-time estimate without starting anything."""
+    settings = validate_settings()
+    if settings is None:
+        return
+
+    queue_files = settings.get("file_queue", [])
+    if queue_files:
+        total_words = 0
+        total_chars = 0
+        total_seconds = 0.0
+        total_fixes = 0
+        for fpath in queue_files:
+            try:
+                text = read_input_file_text(fpath)
+            except OSError as e:
+                error_msg = str(e)
+                messagebox.showerror("Error", f"Could not read input file:\n{fpath}\n\n{error_msg}")
+                return
+            if not text:
+                continue
+            prepared = prepare_input_text(text, settings)
+            text = prepared.clean_text
+            pause_map = prepared.pause_map
+            protection_mask = build_protection_mask(len(text), prepared.protected_ranges)
+            resume_chars = load_resume_state_for(fpath)
+            remaining_text = text[resume_chars:] if resume_chars else text
+            remaining_mask = protection_mask[resume_chars:] if resume_chars else protection_mask
+            marker_seconds = sum(secs for pos, secs in pause_map.items() if pos >= (resume_chars or 0))
+            extra_seconds = (estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
+                             + estimate_format_toggle_seconds(prepared, resume_chars or 0))
+            w_count, c_count, est_sec = estimate_typing_time(
+                remaining_text, settings, remaining_mask, marker_seconds, extra_seconds
+            )
+            total_fixes += len(prepared.fixes)
+            total_words += w_count
+            total_chars += c_count
+            total_seconds += est_sec + clamp_start_countdown(
+                settings.get("start_countdown_seconds", START_COUNTDOWN_DEFAULT)
+            )  # start countdown allowance per file
+
+        if total_chars == 0:
+            preview_result_var.set("All queued files are empty \u2014 nothing to preview.")
+            return
+
+        est_mins = int(total_seconds // 60)
+        est_secs = int(total_seconds % 60)
+        fixes_note = f" \u2022 {total_fixes:,} smart fixes" if total_fixes else ""
+        preview_result_var.set(
+            f"Queue ({len(queue_files)} files): ~{total_words:,} words \u2022 {total_chars:,} characters{fixes_note} \u2022 "
+            f"Estimated time: ~{est_mins}m {est_secs}s (rough estimate)"
+            f"{describe_target_time_plan(settings, total_seconds)}"
+        )
+        return
+
+    try:
+        text = read_input_file_text(settings["input_path"])
+    except OSError as e:
+        error_msg = str(e)
+        messagebox.showerror("Error", f"Could not read input file:\n{error_msg}")
+        return
+
+    if not text:
+        preview_result_var.set("The selected file is empty \u2014 nothing to preview.")
+        return
+
+    prepared = prepare_input_text(text, settings)
+    text = prepared.clean_text
+    pause_map = prepared.pause_map
+    protection_mask = build_protection_mask(len(text), prepared.protected_ranges)
+
+    resume_chars = load_resume_state_for(settings["input_path"])
+    remaining_text = text[resume_chars:] if resume_chars else text
+    remaining_mask = protection_mask[resume_chars:] if resume_chars else protection_mask
+    marker_seconds = sum(secs for pos, secs in pause_map.items() if pos >= (resume_chars or 0))
+    extra_seconds = (estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
+                     + estimate_format_toggle_seconds(prepared, resume_chars or 0))
+
+    word_count, char_count, est_seconds = estimate_typing_time(
+        remaining_text, settings, remaining_mask, marker_seconds, extra_seconds
+    )
+    est_mins = int(est_seconds // 60)
+    est_secs = int(est_seconds % 60)
+    resume_note = " remaining (resume point saved)" if resume_chars else ""
+    fixes_note = f" \u2022 {len(prepared.fixes):,} smart fixes" if prepared.fixes else ""
+    preview_result_var.set(
+        f"{word_count:,} words \u2022 {char_count:,} characters{resume_note}{fixes_note} \u2022 "
+        f"Estimated time: ~{est_mins}m {est_secs}s (rough estimate)"
+        f"{describe_target_time_plan(settings, est_seconds)}"
+    )
+
+
+def notify_finished():
+    """Called on the main thread when a run finishes naturally
+    (never on a manual Stop). Notification and sound are independent
+    toggles -- either, both, or neither can be on."""
+    if enable_sound_var.get() and HAS_WINSOUND:
+        try:
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
+    if enable_notify_var.get():
+        check_summary = get_text_check_summary()
+        message = "Typing session finished!"
+        if check_summary:
+            message += "\n\n" + check_summary
+        messagebox.showinfo("Amanuensis", message)
+
+
+def split_target_time_across_files(settings, files, resume_dict):
+    """Returns one target time (in seconds) for each file in `files`, in the
+    same order. With one file it is the whole target. With a batch queue the
+    target is for the whole run, shared between the files by how much text
+    each one still has to type. Returns zeros when no target time is set or
+    when the run is a preview."""
+    if not settings.get("enable_target_time") or settings.get("preview_mode"):
+        return [0.0] * len(files)
+    total_target = settings.get("target_seconds", 0.0)
+    if len(files) == 1:
+        return [total_target]
+    remaining_chars = []
+    for fpath in files:
+        clean_text = get_clean_text_for_file(fpath, settings)
+        if clean_text is None:
+            remaining_chars.append(0)
+        else:
+            remaining_chars.append(max(len(clean_text) - resume_dict.get(fpath, 0), 0))
+    total_chars = sum(remaining_chars)
+    if total_chars <= 0:
+        return [0.0] * len(files)
+    return [total_target * chars / total_chars for chars in remaining_chars]
+
+
+ES_CONTINUOUS = 0x80000000  # Windows: keep the request until it is changed
+ES_SYSTEM_REQUIRED = 0x00000001  # Windows: the computer should not sleep on its own
+
+
+def set_keep_awake(keep_awake):
+    """Update #46: while True, asks Windows not to put the computer to sleep on
+    its own (the screen may still turn off). False goes back to normal. The
+    request belongs to the thread that makes it, so the thread that turns it
+    on must also turn it off. Returns True if the request was made."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) if keep_awake else ES_CONTINUOUS
+        ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint32(flags))
+        return True
+    except Exception:
+        return False
+
+
+def confirm_scheduled_start(settings):
+    """Update #46: works out when a scheduled run will begin and asks the person
+    to confirm, with warnings. Returns the start moment as a timestamp (seconds
+    since 1970), or None if they chose to go back."""
+    clock = parse_clock_time(settings.get("scheduled_start_time", ""))
+    if clock is None:
+        return None  # validate_settings() already told the person about a bad time
+    now = datetime.now()
+    target = next_scheduled_datetime(clock, now)
+    wait_seconds = (target - now).total_seconds()
+    day_word = "today" if target.date() == now.date() else "tomorrow"
+    clock_text = format_clock_time(clock[0], clock[1])
+
+    lines = [f"Typing will start {day_word} at {clock_text} (in {format_duration_text(wait_seconds)}).", ""]
+    if not (settings.get("locked_window") and HAS_PYGETWINDOW):
+        lines.append(
+            "No target window is locked. When the time comes, Amanuensis will type into "
+            "whichever window is active then. Lock a window on the Window tab if you want "
+            "it to type in one place only."
+        )
+        lines.append("")
+    lines.append(
+        "Keep the computer awake and unlocked until then. Amanuensis asks Windows not to "
+        "go to sleep on its own, but it cannot stop a closed lid, the Sleep command, or a "
+        f"locked screen. If the computer wakes up more than {SCHEDULE_GRACE_SECONDS // 60} "
+        "minutes after the start time, the run is cancelled instead of typing late."
+    )
+    lines.append("")
+    lines.append(
+        "Leave Amanuensis open. After the start time, the normal start countdown runs, "
+        "so be ready. Use Stop or Cancel Scheduled Start to cancel."
+    )
+    lines.append("")
+    lines.append("Click OK to wait for the start time, or Cancel to go back.")
+    if not messagebox.askokcancel("Confirm Scheduled Start", "\n".join(lines)):
+        return None
+    return target.timestamp()
+
+
+def clear_scheduled_start_flag():
+    """A scheduled start is a one-time request. Once the wait is over, the box is
+    unchecked so the next press of Start types right away."""
+    enable_scheduled_start_var.set(False)
+    save_last_settings()
+
+
+def report_missed_scheduled_start(clock_text):
+    """Runs on the main thread when the computer was not awake at the start time
+    and came back more than SCHEDULE_GRACE_SECONDS late."""
+    stop_typing()
+    state.status = "Scheduled start missed"
+    messagebox.showinfo(
+        "Scheduled Start Missed",
+        f"The computer was not awake at {clock_text}, and it came back more than "
+        f"{SCHEDULE_GRACE_SECONDS // 60} minutes late, so nothing was typed.\n\n"
+        "Press Start Typing again to pick a new time.",
+    )
+
+
+def cancel_scheduled_start():
+    """The Cancel Scheduled Start button (Update #46)."""
+    if state.is_running and state.status.startswith("Waiting to start"):
+        stop_typing()
+        state.status = "Scheduled start cancelled"
+    else:
+        messagebox.showinfo("Nothing To Cancel", "No scheduled start is waiting right now.")
+
+
+def wait_for_scheduled_start(settings):
+    """Update #46: runs on the typing thread before the first file. Waits until
+    the scheduled moment (settings['scheduled_start_at']), keeping the computer
+    awake. Returns True when it is time to start, and False when the person
+    cancelled or the start time was missed. Returns True right away when no
+    start time is scheduled or this is a preview."""
+    target = settings.get("scheduled_start_at", 0.0)
+    if not target or settings.get("preview_mode"):
+        return True
+
+    when = datetime.fromtimestamp(target)
+    clock_text = format_clock_time(when.hour, when.minute)
+    log_event("scheduled_wait", f"waiting for {clock_text}")
+    keep_awake = set_keep_awake(True)
+    missed = False
+    last_text = ""
+    try:
+        while True:
+            if stop_event.is_set() or not state.is_running:
+                return False
+            remaining = target - time.time()
+            if remaining <= 0:
+                # A computer that slept through the start time can wake up hours
+                # late. Typing then would surprise the person, so it is cancelled.
+                missed = -remaining > SCHEDULE_GRACE_SECONDS
+                break
+            text = f"Waiting to start at {clock_text} ({format_duration_text(remaining)} left)"
+            if text != last_text:
+                state.status = text
+                last_text = text
+            time.sleep(min(SCHEDULE_POLL_SECONDS, remaining))
+    finally:
+        if keep_awake:
+            set_keep_awake(False)
+
+    run_on_main_thread(clear_scheduled_start_flag)
+    if missed:
+        log_event("scheduled_missed", f"woke up late for {clock_text}")
+        run_on_main_thread(lambda: report_missed_scheduled_start(clock_text))
+        return False
+    state.status = "Countdown..."
+    log_event("scheduled_start", f"reached {clock_text}")
+    return True
+
+
+def run_typing_worker(settings, files, resume_dict):
+    """Processes a list of files sequentially. Each file runs through
+    type_text() completely (including its own start countdown).
+    Stops if stop_event is set or if typing is no longer running. A scheduled
+    start (Update #46) is waited for once, before the first file."""
+    if not wait_for_scheduled_start(settings):
+        return
+    total_files = len(files)
+    target_shares = split_target_time_across_files(settings, files, resume_dict)
+    for idx, file_path in enumerate(files):
+        if stop_event.is_set() or not state.is_running:
+            break
+
+        file_settings = dict(settings)
+        file_settings["input_path"] = file_path
+        file_settings["resume_from"] = resume_dict.get(file_path, 0)
+        file_settings["target_seconds_for_file"] = target_shares[idx]
+        state.settings = file_settings
+
+        is_last = (idx == total_files - 1)
+        type_text(file_settings, is_batch=(total_files > 1), is_last=is_last)
+
+
+def run_typing_worker_safely(settings, files, resume_dict):
+    """Runs run_typing_worker() and, however it ends (finished, stopped, or an
+    error), releases every key Key Press Timing may still be holding down
+    (Update #59), so a key can never be left stuck after a run."""
+    try:
+        run_typing_worker(settings, files, resume_dict)
+    finally:
+        release_all_held_keys()
+
+
+def confirm_pause_marker_warnings(files, settings):
+    """Checks every file about to be typed for inline pause markers that
+    have a problem, BEFORE typing starts: a bad value such as
+    {{pause:abc}} (typed as normal text) or a value over the maximum
+    (shortened). If there is anything to report, asks the person whether
+    to start anyway. Returns True if it is OK to start, False if they
+    chose to go fix the file first."""
+    if not settings.get("enable_pause_markers", True):
+        return True
+
+    problems = []
+    for fpath in files:
+        try:
+            raw_text = read_input_file_text(fpath)
+        except OSError:
+            continue  # type_text() already reports unreadable files
+        _stripped, _pauses, invalid_markers, clamped_markers = strip_pause_markers(raw_text)
+        file_name = os.path.basename(fpath)
+        for marker in invalid_markers[:5]:
+            problems.append(f"{file_name}: {marker}  (invalid, will be typed as normal text)")
+        if len(invalid_markers) > 5:
+            problems.append(f"{file_name}: ...and {len(invalid_markers) - 5} more invalid markers")
+        for marker in clamped_markers[:5]:
+            problems.append(
+                f"{file_name}: {marker}  (over {int(PAUSE_MARKER_MAX_SECONDS)}s, will be shortened)"
+            )
+        if len(clamped_markers) > 5:
+            problems.append(f"{file_name}: ...and {len(clamped_markers) - 5} more over-limit markers")
+
+    if not problems:
+        return True
+
+    return messagebox.askokcancel(
+        "Pause Marker Warning",
+        "Some pause markers need attention:\n\n"
+        + "\n".join(problems)
+        + "\n\nA valid marker looks like {{pause:5}} (seconds, decimals allowed).\n\n"
+        "Click OK to start anyway, or Cancel to fix the file first.",
+    )
+
+
+def confirm_format_marker_warnings(files, settings):
+    """Update #29: checks every file about to be typed for bold or italic
+    markers with no partner (a stray [[/b]], a repeated [[b]], or one that is
+    never closed), BEFORE typing starts. Nothing is typed as text either way,
+    but the person may have made a mistake. Returns True if it is OK to start,
+    False if they chose to go fix the file first."""
+    if not settings.get("enable_format_markers", True):
+        return True
+
+    problems = []
+    for fpath in files:
+        try:
+            raw_text = read_input_file_text(fpath)
+        except OSError:
+            continue  # type_text() already reports unreadable files
+        _stripped, _positions, _spans, file_problems = strip_format_markers(raw_text)
+        file_name = os.path.basename(fpath)
+        for problem in file_problems[:5]:
+            problems.append(f"{file_name}: {problem}")
+        if len(file_problems) > 5:
+            problems.append(f"{file_name}: ...and {len(file_problems) - 5} more")
+
+    if not problems:
+        return True
+
+    return messagebox.askokcancel(
+        "Formatting Marker Warning",
+        "Some bold or italic markers need attention:\n\n"
+        + "\n".join(problems)
+        + "\n\nA pair looks like [[b]]bold text[[/b]] or [[i]]italic text[[/i]].\n\n"
+        "Click OK to start anyway, or Cancel to fix the file first.",
+    )
+
+
+def start_typing():
+    if state.is_running:
+        messagebox.showinfo("Already Running", "The typer is already running.")
+        return
+
+    # Auto Profile by Window (Update #30): this may load a saved profile into
+    # the settings, so it must run before the settings are checked below.
+    keep_starting, auto_profile_used = apply_auto_profile_for_start()
+    if not keep_starting:
+        return
+
+    settings = validate_settings()
+    if settings is None:
+        return
+
+    save_last_settings()
+
+    queue_files = settings.get("file_queue", [])
+    files_to_run = queue_files if queue_files else [settings["input_path"]]
+
+    if not confirm_pause_marker_warnings(files_to_run, settings):
+        return
+
+    if not confirm_format_marker_warnings(files_to_run, settings):
+        return
+
+    if not confirm_target_time_plan(files_to_run, settings):
+        return
+
+    # Scheduled Start (Update #46): ask before anything else happens, so Cancel
+    # leaves everything as it was. The wait itself happens in the worker thread.
+    settings["scheduled_start_at"] = 0.0
+    if settings.get("enable_scheduled_start"):
+        scheduled_at = confirm_scheduled_start(settings)
+        if scheduled_at is None:
+            return
+        settings["scheduled_start_at"] = scheduled_at
+
+    resume_dict = {}
+    for fpath in files_to_run:
+        entry = load_resume_entry(fpath)
+        if entry is None:
+            continue
+
+        chars_typed = entry.get("chars_typed", 0)
+        if chars_typed <= 0:
+            continue
+
+        # Get the clean text so we can validate and compute percent.
+        clean_text = get_clean_text_for_file(fpath, settings)
+        if clean_text is None:
+            # File unreadable; type_text() will report the error.
+            continue
+
+        # Entry is at or past the end of the file — clear it and start fresh.
+        if chars_typed >= len(clean_text):
+            clear_resume_state(fpath)
+            continue
+
+        # Validate: check that the typed prefix hasn't changed.
+        if not validate_resume_entry(entry, clean_text):
+            file_name = os.path.basename(fpath)
+            file_label = f"'{file_name}'" if len(files_to_run) > 1 else "this file"
+            if not messagebox.askokcancel(
+                "Saved Position Cannot Be Trusted",
+                f"The part of {file_label} that was already typed has changed since "
+                f"the progress was saved, so the saved spot cannot be trusted.\n\n"
+                "(This also happens if Smart Text Fixes were turned on or off, or the "
+                "fix groups changed, since the progress was saved.)\n\n"
+                "Click OK to clear the saved progress and start this file from the beginning.\n"
+                "Click Cancel to abort starting so you can fix the file first.",
+            ):
+                return  # user wants to fix the file
+            clear_resume_state(fpath)
+            continue
+
+        # Valid entry — build the resume prompt.
+        pct = (chars_typed / len(clean_text) * 100) if len(clean_text) else 0
+        file_name = os.path.basename(fpath)
+        file_label = f"'{file_name}'" if len(files_to_run) > 1 else "this file"
+
+        saved_at_str = entry.get("saved_at")
+        date_line = ""
+        if saved_at_str:
+            try:
+                saved_dt = datetime.fromisoformat(saved_at_str)
+                date_line = f"\nSaved: {saved_dt.strftime('%b %-d, %-I:%M %p')}.\n"
+            except (ValueError, AttributeError):
+                try:
+                    saved_dt = datetime.fromisoformat(saved_at_str)
+                    date_line = f"\nSaved: {saved_dt.strftime('%b %d, %I:%M %p')}.\n"
+                except Exception:
+                    date_line = ""
+
+        if messagebox.askyesno(
+            "Resume Previous Session?",
+            f"You stopped partway through {file_label} last time "
+            f"(~{pct:.0f}% done).{date_line}\n"
+            "Before clicking Yes, click into your document at the exact spot "
+            "where typing stopped. Amanuensis cannot check this for you.\n\n"
+            "Resume from where you left off? Choose \"No\" to start over from the beginning.",
+        ):
+            resume_dict[fpath] = chars_typed
+        else:
+            clear_resume_state(fpath)
+
+    first_path = files_to_run[0]
+    resume_from = resume_dict.get(first_path, 0)
+    settings["resume_from"] = resume_from
+    settings["input_path"] = first_path
+
+    state.is_running = True
+    state.chars_typed = resume_from
+    state.total_chars = 0
+    state.start_time = time.time()
+    state.paused_duration = 0.0
+    state.wpm = 0
+    state.status = "Waiting to start..." if settings.get("scheduled_start_at") else "Countdown..."
+    state.logging_enabled = log_enabled_var.get()
+    state.log_entries = []
+    if auto_profile_used:
+        # Only the profile's name is logged, never the window title.
+        log_event("auto_profile", f"loaded profile {auto_profile_used}")
+    state.text_check_results = []
+    state.left_mistakes = []
+    state.left_mistakes_resumed = False
+    state.locked_window_title = settings["locked_window"]
+    state.settings = settings
+    stop_event.clear()
+    pause_event.clear()
+    focus_lost_event.clear()
+    skip_break_event.clear()
+    state.in_research_break = False
+
+    btn_start.configure(state=tk.DISABLED)
+    btn_preview.configure(state=tk.DISABLED)
+    btn_pause.configure(state=tk.NORMAL)
+    btn_stop.configure(state=tk.NORMAL)
+
+    thread = threading.Thread(
+        target=run_typing_worker_safely,
+        args=(settings, files_to_run, resume_dict),
+    )
+    thread.daemon = True
+    thread.start()
+
+    if settings.get("auto_pause_activity") and not settings.get("preview_mode"):
+        watcher_thread = threading.Thread(
+            target=_activity_watcher,
+            args=(settings.get("activity_sensitivity", 20.0), settings.get("alert_on_auto_pause", False)),
+            daemon=True,
+        )
+        watcher_thread.start()
+
+
+def open_preview_window():
+    """Opens a Toplevel window with a large Text box and runs a full
+    type_text() session against it instead of the real screen. Reuses
+    type_text() and the same background-thread + stop/pause
+    infrastructure as a real run -- the only difference is that
+    settings['preview_mode'] is True, so _send_char() / _send_backspace()
+    (see the PREVIEW MODE section above) write
+    into the Text box via run_on_main_thread() instead of calling
+    pyautogui. type_text() itself skips the start countdown when
+    preview_mode is set, since there's no target window to switch to.
+    Preview runs always start from the top of the current input file
+    and process just that one file -- never resume checkpoints, batch
+    queues, or the session log, since none of that applies to a run
+    that never touches another window (see stop_typing())."""
+    global preview_text_widget, preview_speed_now
+
+    if state.is_running:
+        messagebox.showinfo("Already Running", "Stop the current session before starting a preview.")
+        return
+
+    settings = validate_settings()
+    if settings is None:
+        return
+    preview_speed_now = settings["preview_speed"]
+    settings["preview_mode"] = True
+    settings["resume_from"] = 0
+    settings["locked_window"] = ""
+
+    queue_files = settings.get("file_queue", [])
+    if queue_files:
+        settings["input_path"] = queue_files[0]
+
+    save_last_settings()
+
+    preview_win = modern_toplevel(window, "Preview Run", "640x480", (400, 300))
+
+    modern_label(
+        preview_win,
+        "Preview only \u2014 nothing is typed into any other window.",
+        kind="muted",
+    ).pack(anchor="w", padx=12, pady=(10, 4))
+
+    def _on_preview_speed_chosen(choice=None):
+        """Runs when a playback speed is picked. Takes effect right away, even in
+        the middle of the preview, and is saved for next time."""
+        global preview_speed_now
+        chosen = clamp_preview_speed(choice if choice is not None else preview_speed_var.get())
+        preview_speed_now = chosen
+        preview_speed_var.set(preview_speed_label(chosen))
+        save_last_settings()
+
+    speed_row = modern_frame(preview_win)
+    speed_row.pack(anchor="w", padx=12, pady=(0, 6))
+    modern_label(speed_row, "Playback speed:").pack(side="left", padx=(0, 8))
+    speed_combo = modern_combobox(speed_row, preview_speed_var, width=8)
+    speed_combo.configure(
+        values=[preview_speed_label(choice) for choice in PREVIEW_SPEED_CHOICES],
+        command=_on_preview_speed_chosen,
+    )
+    speed_combo.pack(side="left")
+    modern_label(speed_row, "Preview only. Real typing is never sped up.", kind="muted").pack(
+        side="left", padx=(10, 0)
+    )
+
+    preview_box = modern_textbox(preview_win)
+    preview_box.configure(state=tk.DISABLED)
+    preview_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    modern_button(preview_win, "Stop Preview", stop_typing, kind="danger").pack(
+        anchor="w", padx=12, pady=(0, 12)
+    )
+
+    preview_text_widget = preview_box
+
+    def _on_preview_close():
+        stop_typing()
+        preview_win.destroy()
+
+    preview_win.protocol("WM_DELETE_WINDOW", _on_preview_close)
+
+    state.is_running = True
+    state.chars_typed = 0
+    state.total_chars = 0
+    state.start_time = time.time()
+    state.paused_duration = 0.0
+    state.wpm = 0
+    state.status = "Typing..."
+    state.logging_enabled = False
+    state.log_entries = []
+    state.text_check_results = []
+    state.left_mistakes = []
+    state.left_mistakes_resumed = False
+    state.locked_window_title = ""
+    state.settings = settings
+    stop_event.clear()
+    pause_event.clear()
+    focus_lost_event.clear()
+    skip_break_event.clear()
+    state.in_research_break = False
+
+    btn_start.configure(state=tk.DISABLED)
+    btn_preview.configure(state=tk.DISABLED)
+    btn_pause.configure(state=tk.NORMAL)
+    btn_stop.configure(state=tk.NORMAL)
+
+    thread = threading.Thread(target=type_text, args=(settings,), kwargs={"is_batch": False, "is_last": True})
+    thread.daemon = True
+    thread.start()
+
+
+SMART_FIX_REVIEW_LIMIT = 300  # most fixes listed in the review window
+
+
+def open_smart_fix_review():
+    """Opens a window listing every smart fix planned for the current input
+    file (the first queued file when a queue is set up), with its line number
+    and a before/after snippet. Nothing is typed or changed. It shows what
+    WOULD change using the fix-group switches on the card, even while
+    'Enable smart text fixes' itself is off."""
+    settings = validate_settings()
+    if settings is None:
+        return
+
+    queue_files = settings.get("file_queue", [])
+    file_path = queue_files[0] if queue_files else settings["input_path"]
+
+    if get_smart_fix_options(settings, ignore_master=True) is None:
+        messagebox.showinfo("Nothing To Review", "Turn on at least one fix group first.")
+        return
+
+    try:
+        raw_text = read_input_file_text(file_path)
+    except OSError as e:
+        error_msg = str(e)
+        messagebox.showerror("Error", f"Could not read input file:\n{error_msg}")
+        return
+
+    review_settings = dict(settings)
+    review_settings["enable_smart_fixes"] = True
+    prepared = prepare_input_text(raw_text, review_settings)
+    if not prepared.fixes:
+        messagebox.showinfo("Nothing To Fix", "No smart fixes are needed for this file.")
+        return
+
+    counts = {}
+    for fix in prepared.fixes:
+        counts[fix.kind] = counts.get(fix.kind, 0) + 1
+    report_lines = ["Summary"]
+    for kind, count in sorted(counts.items(), key=lambda item: -item[1]):
+        report_lines.append(f"  {count} x {SMART_FIX_LABELS.get(kind, kind)}")
+    report_lines.append("")
+
+    for fix in prepared.fixes[:SMART_FIX_REVIEW_LIMIT]:
+        line_number, label, before, after = describe_smart_fix(prepared.source_text, fix)
+        report_lines.append(f"Line {line_number}: {label}")
+        report_lines.append(f"   before: {before}")
+        report_lines.append(f"   after:  {after}")
+        report_lines.append("")
+    hidden_count = len(prepared.fixes) - SMART_FIX_REVIEW_LIMIT
+    if hidden_count > 0:
+        report_lines.append(f"...and {hidden_count} more fixes not shown.")
+
+    review_win = modern_toplevel(window, "Smart Fix Review", "720x520", (480, 320))
+
+    intro = f"{os.path.basename(file_path)}: {len(prepared.fixes):,} fixes planned. Nothing is typed from here."
+    if not settings.get("enable_smart_fixes"):
+        intro += "\nSmart text fixes are switched off right now, so this is only a preview."
+    intro += "\nThe changed part is shown between \u00ab \u00bb (dots are spaces, arrows are line breaks)."
+    modern_label(review_win, intro, kind="muted").pack(anchor="w", padx=12, pady=(10, 4))
+
+    review_box = modern_textbox(review_win)
+    review_box.insert("1.0", "\n".join(report_lines))
+    review_box.configure(state=tk.DISABLED)
+    review_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    modern_button(review_win, "Close", review_win.destroy, kind="neutral").pack(
+        anchor="w", padx=12, pady=(0, 12)
+    )
+
+
+def build_left_mistake_report_text(mistakes, was_stopped, was_resumed):
+    """Builds the plain-text list shown in (and saved from) the Mistakes Left
+    For You window. One numbered entry per mistake: where it is, what kind it
+    is, what is on screen, and what it should be."""
+    counts = {}
+    for item in mistakes:
+        counts[item["label"]] = counts.get(item["label"], 0) + 1
+    show_file_names = len({item["file"] for item in mistakes}) > 1
+
+    lines = [f"{len(mistakes)} mistake(s) left in your text", ""]
+    for label, count in sorted(counts.items(), key=lambda pair: -pair[1]):
+        lines.append(f"  {count} x {label}")
+    lines.append("")
+    lines.append("The part to look at is shown between \u00ab \u00bb (\u21b5 is a line break).")
+    lines.append("")
+
+    for number, item in enumerate(mistakes, start=1):
+        where = f"Line {item['line']}"
+        if show_file_names:
+            where = f"{item['file']}, {where}"
+        lines.append(f"{number}. {where}: {item['label']}")
+        lines.append(f"     on screen:  {item['typed_snippet']}")
+        lines.append(f"     should be:  {item['correct_snippet']}")
+        lines.append("")
+
+    if was_stopped:
+        lines.append("The run was stopped early, so only the mistakes typed so far are listed.")
+    if was_resumed:
+        lines.append(
+            "This run was resumed, so mistakes left in an earlier session are not listed here."
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def open_left_mistake_report():
+    """Opens the Mistakes Left For You window for the most recent run. It
+    opens by itself when a run that left mistakes ends, and the button on the
+    Leave Mistakes For Me card opens it again."""
+    mistakes = list(state.left_mistakes)
+    if not mistakes:
+        messagebox.showinfo(
+            "No Mistakes Left",
+            "No mistakes have been left in your text yet.\n\n"
+            "Turn on 'Leave some mistakes for me to fix' on the Mistakes tab, then start a run.",
+        )
+        return
+
+    report_text = build_left_mistake_report_text(
+        mistakes, state.status == "Stopped", state.left_mistakes_resumed
+    )
+
+    report_win = modern_toplevel(window, "Mistakes Left For You", "780x580", (520, 340))
+    modern_label(
+        report_win,
+        f"{len(mistakes)} mistake(s) were purposely left in your text. "
+        "Use Find (Ctrl+F) in your document to jump to each one, then fix it.",
+        kind="muted",
+        wraplength=720,
+    ).pack(anchor="w", padx=12, pady=(10, 4))
+
+    report_box = modern_textbox(report_win)
+    report_box.insert("1.0", report_text)
+    report_box.configure(state=tk.DISABLED)
+    report_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    def copy_report():
+        window.clipboard_clear()
+        window.clipboard_append(report_text)
+
+    def save_report():
+        save_path = filedialog.asksaveasfilename(
+            parent=report_win,
+            title="Save Mistake List",
+            defaultextension=".txt",
+            initialfile="amanuensis_mistakes.txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not save_path:
+            return
+        try:
+            with open(save_path, "w", encoding="utf-8") as report_file:
+                report_file.write(report_text)
+        except OSError as e:
+            error_msg = str(e)
+            messagebox.showerror("Error", f"Could not save the list:\n{error_msg}")
+
+    button_row = modern_frame(report_win)
+    button_row.pack(anchor="w", padx=12, pady=(0, 12))
+    modern_button(button_row, "Copy List", copy_report, kind="primary").pack(side="left")
+    modern_button(button_row, "Save List...", save_report, kind="neutral").pack(side="left", padx=(8, 0))
+    modern_button(button_row, "Close", report_win.destroy, kind="neutral").pack(side="left", padx=(8, 0))
+
+
+# --------------------------------------------
+# UPDATE CHECKER (Update #25)
+# --------------------------------------------
+# On launch (if turned on) and when the person clicks "Check for Updates
+# Now", the app asks GitHub for the newest release and compares its version
+# number with APP_VERSION. It uses only the standard library, so there is no
+# new package. The only thing sent is an ordinary web request, so GitHub sees
+# the person's IP address and the app version. Nothing from their text or
+# settings is sent.
+#
+# Safety rules (do not loosen these):
+#   - HTTPS only, and only to the GitHub hosts in UPDATE_ALLOWED_HOSTS. A
+#     redirect to any other address is refused.
+#   - All network work runs on a background thread. Results reach the window
+#     only through run_on_main_thread().
+#   - No dialog is shown while a run is active, because a pop-up would steal
+#     focus from the window being typed into.
+#   - The app only replaces itself when the person clicks "Update and Restart",
+#     and only when it is the packaged Windows .exe, its folder can be written
+#     to, and the download matched the checksum GitHub published. It swaps the
+#     files by renaming (the running .exe becomes .old and the new one takes its
+#     place), puts the old one back if any step fails, and never does it while a
+#     typing run is active. In every other case "Download" saves the new .exe as
+#     a separate file, checks it, and tells the person what to do next.
+GITHUB_REPO = "jheathspooky009/Amanuensis"
+UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases"
+UPDATE_ASSET_NAME = "amanuensis.exe"  # the file release.yml attaches to each release
+UPDATE_ALLOWED_HOSTS = (
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+UPDATE_TIMEOUT_SECONDS = 10
+UPDATE_STARTUP_DELAY_MS = 3000       # wait a moment so the window is fully drawn first
+UPDATE_MAX_API_BYTES = 1024 * 1024   # the release info should be tiny; refuse anything huge
+UPDATE_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+UPDATE_NOTES_MAX_CHARS = 600
+UPDATE_STAGED_SUFFIX = ".new"        # the new .exe waits next to the running one under this ending
+UPDATE_BACKUP_SUFFIX = ".old"        # the replaced .exe is kept under this ending until the next launch
+UPDATE_CLEANUP_DELAY_MS = 6000       # give the old copy time to fully close before deleting leftovers
+
+# Only touched on the main thread, so a plain flag is enough.
+_update_check_running = False
+_update_download_running = False
+
+
+def is_allowed_update_url(url):
+    """True only for an https address on one of the GitHub hosts above."""
+    try:
+        parts = urllib.parse.urlparse(str(url))
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and host in UPDATE_ALLOWED_HOSTS
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows redirects (GitHub sends downloads to another GitHub host) but
+    refuses to be sent anywhere that is not on the allowed list."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_allowed_update_url(newurl):
+            raise urllib.error.URLError("Blocked a redirect to an unexpected address.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def parse_version_text(text):
+    """Turns 'v4.4.0' or '4.4' into a tuple like (4, 4, 0) so versions can be
+    compared as numbers. Returns None for anything else (for example a tag
+    like 'v5.0-beta'), and callers treat None as 'ignore this'."""
+    match = re.fullmatch(r"[vV]?(\d+)\.(\d+)(?:\.(\d+))?", str(text).strip())
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+
+
+def _build_update_request(url, accept_header):
+    return urllib.request.Request(
+        url, headers={"Accept": accept_header, "User-Agent": f"Amanuensis/{APP_VERSION}"}
+    )
+
+
+def fetch_latest_release():
+    """Asks GitHub for the newest published release. Runs on a background
+    thread. Returns a dict. On success it has ok=True plus version,
+    version_tuple, page_url, notes, asset_url, asset_size, and asset_digest
+    (empty or 0 when missing). On failure it has ok=False plus a plain-English
+    error message."""
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    request = _build_update_request(UPDATE_API_URL, "application/vnd.github+json")
+    try:
+        with opener.open(request, timeout=UPDATE_TIMEOUT_SECONDS) as response:
+            raw_bytes = response.read(UPDATE_MAX_API_BYTES)
+        release = json.loads(raw_bytes.decode("utf-8"))
+    except urllib.error.HTTPError as http_error:
+        if http_error.code == 404:
+            message = (
+                "GitHub has no public release for Amanuensis yet. If the repository is "
+                "private, update checks cannot see it."
+            )
+        elif http_error.code in (403, 429):
+            message = "GitHub is limiting requests right now. Try again in a little while."
+        else:
+            message = f"GitHub answered with error {http_error.code}."
+        return {"ok": False, "error": message}
+    except (urllib.error.URLError, OSError):
+        return {"ok": False, "error": "Could not reach GitHub. Check your internet connection."}
+    except ValueError:
+        return {"ok": False, "error": "GitHub sent an answer this app could not read."}
+
+    if not isinstance(release, dict):
+        return {"ok": False, "error": "GitHub sent an answer this app could not read."}
+    version_tuple = parse_version_text(release.get("tag_name", ""))
+    if version_tuple is None:
+        return {"ok": False, "error": "The newest release has a version name this app cannot read."}
+
+    notes = str(release.get("body") or "").strip()
+    if len(notes) > UPDATE_NOTES_MAX_CHARS:
+        notes = notes[:UPDATE_NOTES_MAX_CHARS].rstrip() + "..."
+    page_url = str(release.get("html_url") or "")
+    if not is_allowed_update_url(page_url):
+        page_url = UPDATE_RELEASES_PAGE_URL
+
+    asset_url = ""
+    asset_size = 0
+    asset_digest = ""
+    assets = release.get("assets")
+    for asset in assets if isinstance(assets, list) else []:
+        if not isinstance(asset, dict):
+            continue
+        if str(asset.get("name", "")).lower() != UPDATE_ASSET_NAME:
+            continue
+        candidate_url = str(asset.get("browser_download_url") or "")
+        if not is_allowed_update_url(candidate_url):
+            continue
+        asset_url = candidate_url
+        try:
+            asset_size = int(asset.get("size") or 0)
+        except (TypeError, ValueError):
+            asset_size = 0
+        digest_match = re.fullmatch(r"sha256:([0-9a-f]{64})", str(asset.get("digest") or "").lower())
+        asset_digest = digest_match.group(1) if digest_match else ""
+        break
+
+    return {
+        "ok": True,
+        "version": ".".join(str(part) for part in version_tuple),
+        "version_tuple": version_tuple,
+        "page_url": page_url,
+        "notes": notes,
+        "asset_url": asset_url,
+        "asset_size": asset_size,
+        "asset_digest": asset_digest,
+    }
+
+
+def _update_check_worker(is_manual):
+    """Background thread body for one update check."""
+    try:
+        result = fetch_latest_release()
+    except Exception:
+        # Networking can fail in many ways. Whatever happens here, the app
+        # must keep working, so report it as a normal failed check.
+        result = {"ok": False, "error": "Something unexpected went wrong while checking for updates."}
+    run_on_main_thread(lambda: handle_update_check_result(result, is_manual))
+
+
+def run_update_check(is_manual):
+    """Starts an update check in the background. is_manual is True when the
+    person clicked the button (so they always get an answer) and False for
+    the automatic check at startup (which stays quiet unless there is news)."""
+    global _update_check_running
+    if _update_check_running or _update_download_running:
+        return
+    if state.is_running:
+        update_status_var.set("Update check skipped because a run is active.")
+        return
+    _update_check_running = True
+    update_status_var.set("Checking for updates...")
+    threading.Thread(target=_update_check_worker, args=(is_manual,), daemon=True).start()
+
+
+def check_for_updates_now():
+    run_update_check(True)
+
+
+def run_startup_update_check():
+    if enable_update_check_var.get():
+        run_update_check(False)
+
+
+def handle_update_check_result(result, is_manual):
+    """Runs on the main thread when a check finishes."""
+    global _update_check_running
+    _update_check_running = False
+    checked_at = datetime.now().strftime("%H:%M")
+
+    if not result["ok"]:
+        update_status_var.set(f"Last check ({checked_at}) failed: {result['error']}")
+        if is_manual and not state.is_running:
+            messagebox.showerror("Update Check Failed", result["error"])
+        return
+
+    current_tuple = parse_version_text(APP_VERSION)
+    if current_tuple is None or result["version_tuple"] <= current_tuple:
+        update_status_var.set(f"Last check ({checked_at}): you have the newest version (v{APP_VERSION}).")
+        if is_manual and not state.is_running:
+            messagebox.showinfo("Up To Date", f"You already have the newest version (v{APP_VERSION}).")
+        return
+
+    update_status_var.set(f"Last check ({checked_at}): version {result['version']} is available.")
+    if state.is_running:
+        return  # never pop up over a run; the status line above is enough
+    skipped_tuple = parse_version_text(skipped_update_version_var.get())
+    if not is_manual and skipped_tuple == result["version_tuple"]:
+        return  # the person chose to skip this exact version
+    show_update_prompt(result)
+
+
+def show_update_prompt(info):
+    """Tells the person a newer version exists and lets them choose what to do."""
+    is_packaged = bool(getattr(sys, "frozen", False))
+    can_download = is_packaged and bool(info["asset_url"])
+    # Replacing the app in place needs a checksum to compare against, so a
+    # release without one only offers the plain separate-file download.
+    can_install = can_download and bool(info["asset_digest"]) and can_update_in_place()
+    notes_text = info["notes"] if info["notes"] else "No release notes were provided."
+    message = (
+        f"Amanuensis v{info['version']} is available. You are using v{APP_VERSION}.\n\n"
+        f"What's new:\n{notes_text}\n\n"
+    )
+    buttons = []
+    if can_install:
+        message += (
+            "Update and Restart downloads the new version, checks it against the checksum GitHub "
+            "published, replaces this app, and opens the new version. Your settings, profiles, and "
+            "saved progress stay as they are. Amanuensis closes for a moment while it restarts."
+        )
+        buttons.append(("Update and Restart", "install", "primary"))
+        buttons.append(("Visit GitHub Page", "visit", "neutral"))
+    elif can_download:
+        message += "Download saves the new version as a separate file. Nothing is replaced or restarted for you."
+        buttons.append(("Download Update", "download", "primary"))
+        buttons.append(("Visit GitHub Page", "visit", "neutral"))
+    else:
+        if is_packaged:
+            message += "No downloadable file was found on that release, so use the GitHub page."
+        else:
+            message += "You are running Amanuensis from its source code, so update it from the GitHub page."
+        buttons.append(("Visit GitHub Page", "visit", "primary"))
+    buttons.append(("Skip This Version", "skip", "neutral"))
+    buttons.append(("Later", "later", "neutral"))
+
+    choice = show_modern_dialog("Update Available", message, buttons, kind="info", cancel_value="later")
+    if choice == "install":
+        start_update_download(info, install_in_place=True)
+    elif choice == "download":
+        start_update_download(info)
+    elif choice == "visit":
+        page_url = info["page_url"]
+        if not is_allowed_update_url(page_url):
+            page_url = UPDATE_RELEASES_PAGE_URL
+        webbrowser.open(page_url)
+    elif choice == "skip":
+        skipped_update_version_var.set(info["version"])
+        update_status_var.set(
+            f"Skipping v{info['version']}. The startup check will stay quiet until a newer version "
+            "comes out. Check for Updates Now still shows it."
+        )
+
+
+def get_running_exe_path():
+    """Full path of the packaged .exe that is running right now."""
+    return os.path.abspath(sys.executable)
+
+
+def can_update_in_place():
+    """True only when the app can safely swap its own .exe: the packaged
+    Windows build, started from a real .exe file, in a folder it can write
+    to. Anything else keeps the plain separate-file Download."""
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return False
+    exe_path = get_running_exe_path()
+    if not exe_path.lower().endswith(".exe") or not os.path.isfile(exe_path):
+        return False
+    return os.access(os.path.dirname(exe_path), os.W_OK)
+
+
+def cleanup_update_leftovers():
+    """Deletes the old copy and any unfinished download that a past update
+    left next to the .exe. Any problem is ignored, and it tries again at the
+    next launch."""
+    if not getattr(sys, "frozen", False) or _update_download_running:
+        return
+    exe_path = get_running_exe_path()
+    for suffix in (UPDATE_BACKUP_SUFFIX, UPDATE_STAGED_SUFFIX, UPDATE_STAGED_SUFFIX + ".part"):
+        leftover_path = exe_path + suffix
+        if os.path.isfile(leftover_path):
+            try:
+                os.remove(leftover_path)
+            except OSError:
+                pass
+
+
+def install_staged_update(staged_path):
+    """Swaps the downloaded .exe in for the running one. Windows lets a
+    running .exe be renamed but not overwritten, so the running file is
+    renamed to .old first. Returns (ok, message). If any step fails, the old
+    file is put back, so the app is never left without a working .exe."""
+    exe_path = get_running_exe_path()
+    backup_path = exe_path + UPDATE_BACKUP_SUFFIX
+    try:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        os.replace(exe_path, backup_path)
+    except OSError as rename_error:
+        rename_text = str(rename_error)
+        return False, f"The current app file could not be set aside, so nothing was changed: {rename_text}"
+    try:
+        os.replace(staged_path, exe_path)
+    except OSError as move_error:
+        move_text = str(move_error)
+        try:
+            os.replace(backup_path, exe_path)
+        except OSError:
+            return False, (
+                f"The new file could not be put in place ({move_text}), and the old file could not be "
+                f"restored automatically. It is saved as: {backup_path}"
+            )
+        return False, f"The new file could not be put in place, so your current version was kept: {move_text}"
+    return True, ""
+
+
+def start_new_copy_of_app():
+    """Opens the freshly installed .exe as its own program. Returns True if
+    it started. The hotkeys are released first so the two copies never both
+    answer a hotkey press."""
+    exe_path = get_running_exe_path()
+    environment = dict(os.environ)
+    # A one-file PyInstaller app hands its temporary folder to any program it
+    # starts. The new copy must unpack its own, so these are cleared.
+    environment.pop("_MEIPASS2", None)
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    process_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    keyboard.unhook_all()
+    try:
+        subprocess.Popen(
+            [exe_path],
+            cwd=os.path.dirname(exe_path),
+            env=environment,
+            close_fds=True,
+            creationflags=process_flags,
+        )
+    except OSError:
+        apply_hotkeys()
+        return False
+    return True
+
+
+def choose_update_folder():
+    """Picks where the downloaded file goes. Returns (folder, is_app_folder).
+    Next to the running app is best, because the app keeps its saved settings
+    in its own folder, so a new copy there finds them. If that folder cannot
+    be written to (for example Program Files), the Downloads folder is used."""
+    app_folder = get_base_dir()
+    if getattr(sys, "frozen", False) and os.access(app_folder, os.W_OK):
+        return app_folder, True
+    downloads_folder = os.path.join(os.path.expanduser("~"), "Downloads")
+    if os.path.isdir(downloads_folder) and os.access(downloads_folder, os.W_OK):
+        return downloads_folder, False
+    return app_folder, True
+
+
+def make_unique_path(folder, file_name):
+    """A path in folder that does not exist yet, so nothing is overwritten."""
+    base_name, extension = os.path.splitext(file_name)
+    path = os.path.join(folder, file_name)
+    counter = 2
+    while os.path.exists(path) or os.path.exists(path + ".part"):
+        path = os.path.join(folder, f"{base_name} ({counter}){extension}")
+        counter += 1
+    return path
+
+
+def start_update_download(info, install_in_place=False):
+    """Opens a small progress window and downloads the new .exe on a
+    background thread. With install_in_place, the file is saved next to the
+    running .exe under a temporary name, and the app swaps it in and restarts
+    once it has been checked."""
+    global _update_download_running
+    if _update_download_running or _update_check_running:
+        return
+    if install_in_place:
+        is_app_folder = True
+        target_path = get_running_exe_path() + UPDATE_STAGED_SUFFIX
+        for stale_path in (target_path, target_path + ".part"):
+            if os.path.exists(stale_path):
+                try:
+                    os.remove(stale_path)
+                except OSError:
+                    update_status_var.set("Update stopped: an old unfinished download could not be removed.")
+                    return
+    else:
+        folder, is_app_folder = choose_update_folder()
+        target_path = make_unique_path(folder, f"amanuensis-v{info['version']}.exe")
+    cancel_event = threading.Event()
+    progress_var = tk.DoubleVar(value=0.0)
+    message_var = tk.StringVar(value="Starting download...")
+
+    progress_win = modern_toplevel(window, "Downloading Update", "440x190", (400, 170))
+    modern_label(progress_win, f"Downloading Amanuensis v{info['version']}", kind="status").pack(
+        anchor="w", padx=14, pady=(14, 4)
+    )
+    modern_progressbar(progress_win, progress_var).pack(fill="x", padx=14, pady=4)
+    modern_label(progress_win, textvariable=message_var, kind="muted", wraplength=400).pack(
+        anchor="w", padx=14, pady=(4, 8)
+    )
+    modern_button(progress_win, "Cancel", cancel_event.set, kind="neutral").pack(
+        anchor="e", padx=14, pady=(0, 12)
+    )
+    progress_win.protocol("WM_DELETE_WINDOW", cancel_event.set)
+
+    _update_download_running = True
+    update_status_var.set(f"Downloading v{info['version']}...")
+    threading.Thread(
+        target=_update_download_worker,
+        args=(info, target_path, is_app_folder, cancel_event, progress_var, message_var, progress_win,
+              install_in_place),
+        daemon=True,
+    ).start()
+
+
+def _download_update_file(info, part_path, cancel_event, progress_var, message_var):
+    """Streams the file to part_path and checks it. Returns a dict with
+    ok, cancelled, verified, and text (the error message when ok is False).
+    Runs on the background thread, so the window is only reached through
+    run_on_main_thread()."""
+    outcome = {"ok": False, "cancelled": False, "verified": False, "text": ""}
+    hasher = hashlib.sha256()
+    received = 0
+    last_percent = -1
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    request = _build_update_request(info["asset_url"], "application/octet-stream")
+    try:
+        with opener.open(request, timeout=UPDATE_TIMEOUT_SECONDS) as response:
+            try:
+                total_bytes = int(response.headers.get("Content-Length") or info["asset_size"] or 0)
+            except ValueError:
+                total_bytes = int(info["asset_size"] or 0)
+            if total_bytes > UPDATE_MAX_DOWNLOAD_BYTES:
+                outcome["text"] = "The file is much larger than expected, so it was not downloaded."
+                return outcome
+            with open(part_path, "wb") as part_file:
+                while True:
+                    if cancel_event.is_set():
+                        outcome["cancelled"] = True
+                        return outcome
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    if received == 0 and not chunk.startswith(b"MZ"):
+                        outcome["text"] = "The downloaded file is not a Windows program, so it was thrown away."
+                        return outcome
+                    received += len(chunk)
+                    if received > UPDATE_MAX_DOWNLOAD_BYTES:
+                        outcome["text"] = "The file is much larger than expected, so the download was stopped."
+                        return outcome
+                    hasher.update(chunk)
+                    part_file.write(chunk)
+                    if total_bytes:
+                        percent = int(received * 100 / total_bytes)
+                        if percent != last_percent:
+                            last_percent = percent
+                            megabytes = received / (1024 * 1024)
+                            run_on_main_thread(lambda p=percent: progress_var.set(p))
+                            run_on_main_thread(
+                                lambda m=megabytes, p=percent: message_var.set(f"{p}%  ({m:.1f} MB)")
+                            )
+    except (urllib.error.URLError, OSError) as download_error:
+        error_text = str(download_error)
+        outcome["text"] = f"The download failed: {error_text}"
+        return outcome
+
+    if received == 0:
+        outcome["text"] = "The download was empty."
+        return outcome
+    if info["asset_size"] and received != info["asset_size"]:
+        outcome["text"] = "The download was incomplete (the size did not match), so it was thrown away."
+        return outcome
+    if info["asset_digest"]:
+        if hasher.hexdigest() != info["asset_digest"]:
+            outcome["text"] = (
+                "The downloaded file did not match the checksum GitHub published for it, "
+                "so it was thrown away. Do not use it."
+            )
+            return outcome
+        outcome["verified"] = True
+    outcome["ok"] = True
+    return outcome
+
+
+def _update_download_worker(info, target_path, is_app_folder, cancel_event, progress_var, message_var,
+                            progress_win, install_in_place=False):
+    """Background thread body for one download."""
+    part_path = target_path + ".part"
+    try:
+        outcome = _download_update_file(info, part_path, cancel_event, progress_var, message_var)
+        if outcome["ok"]:
+            try:
+                os.replace(part_path, target_path)
+            except OSError as move_error:
+                move_text = str(move_error)
+                outcome = {"ok": False, "cancelled": False, "verified": False,
+                           "text": f"The file could not be saved: {move_text}"}
+    except Exception:
+        outcome = {"ok": False, "cancelled": False, "verified": False,
+                   "text": "Something unexpected went wrong during the download."}
+    finally:
+        # Anything still named .part is an unfinished or rejected download.
+        if os.path.exists(part_path):
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+    run_on_main_thread(
+        lambda: finish_update_download(progress_win, info, target_path, is_app_folder, outcome, install_in_place)
+    )
+
+
+def finish_update_download(progress_win, info, target_path, is_app_folder, outcome, install_in_place=False):
+    """Runs on the main thread when a download ends, whatever the result."""
+    global _update_download_running
+    _update_download_running = False
+    try:
+        progress_win.destroy()
+    except tk.TclError:
+        pass
+
+    if outcome["cancelled"]:
+        update_status_var.set("Download cancelled.")
+        return
+    if not outcome["ok"]:
+        update_status_var.set("Download failed.")
+        if not state.is_running:
+            messagebox.showerror("Download Failed", outcome["text"])
+        return
+
+    if install_in_place:
+        finish_in_place_update(info, target_path, outcome)
+        return
+
+    update_status_var.set(f"Downloaded v{info['version']} to: {target_path}")
+    if state.is_running:
+        return  # no pop-up over a run; the status line above has the location
+    if outcome["verified"]:
+        check_text = "Its checksum matched the one GitHub published."
+    else:
+        check_text = "GitHub did not publish a checksum for this file, so it could not be verified."
+    if is_app_folder:
+        settings_text = "It sits next to your current copy, so your saved settings will carry over."
+    else:
+        settings_text = (
+            "It is not next to your current copy. To keep your settings, copy last_settings.json "
+            "from the old app's folder into the new file's folder."
+        )
+    open_folder = messagebox.askyesno(
+        "Update Downloaded",
+        f"Amanuensis v{info['version']} was saved to:\n{target_path}\n\n"
+        f"{check_text}\n{settings_text}\n\n"
+        "To finish updating, close Amanuensis and open the new file. Open that folder now?",
+    )
+    if open_folder and hasattr(os, "startfile"):
+        try:
+            os.startfile(os.path.dirname(target_path))
+        except OSError:
+            pass
+
+
+def finish_in_place_update(info, staged_path, outcome):
+    """Runs on the main thread after the new .exe finished downloading for
+    Update and Restart. Installs it and restarts, or throws the download away
+    and explains why. The app keeps running its current version unless the
+    swap fully succeeds."""
+
+    def throw_away_download():
+        try:
+            os.remove(staged_path)
+        except OSError:
+            pass
+
+    if not outcome["verified"]:
+        throw_away_download()
+        update_status_var.set("Update stopped: the download could not be checked against GitHub's checksum.")
+        if not state.is_running:
+            messagebox.showerror(
+                "Update Stopped",
+                "The downloaded file could not be checked against a checksum, so it was not installed. "
+                "Your current version was not changed.",
+            )
+        return
+    if state.is_running:
+        # Never swap the app out from under a typing run.
+        throw_away_download()
+        update_status_var.set(
+            f"v{info['version']} was not installed because a run is active. "
+            "Use Check for Updates Now when the run is over."
+        )
+        return
+
+    installed, problem_text = install_staged_update(staged_path)
+    if not installed:
+        throw_away_download()
+        update_status_var.set("Update failed. Your current version was kept.")
+        messagebox.showerror("Update Failed", problem_text)
+        return
+
+    update_status_var.set(f"Installed v{info['version']}. Restarting...")
+    if start_new_copy_of_app():
+        # Close through the normal path (it saves settings). This waits a
+        # moment so the queue loop that called us is not left with a closed window.
+        window.after(300, on_close)
+    else:
+        update_status_var.set(f"Installed v{info['version']}. Close Amanuensis and open it again to use it.")
+        messagebox.showinfo(
+            "Update Installed",
+            f"Amanuensis v{info['version']} was installed, but it could not open itself.\n\n"
+            "Close this window and open Amanuensis again to use the new version.",
+        )
+
+
+def toggle_pause():
+    if not state.is_running:
+        return
+    if pause_event.is_set():
+        pause_event.clear()
+        btn_pause.configure(text="Pause Typing")
+    else:
+        pause_event.set()
+        btn_pause.configure(text="Resume Typing")
+        log_event("manual_pause", "")
+
+
+def refresh_skip_break_button():
+    """Turns the Skip Break button on only while a research break is counting
+    down in a run that is still going (Update #50). Runs on the main thread."""
+    if state.is_running and state.in_research_break:
+        btn_skip_break.configure(state=tk.NORMAL)
+    else:
+        btn_skip_break.configure(state=tk.DISABLED)
+
+
+def skip_research_break():
+    """Ends the research break that is counting down right now, from the Skip
+    Break button or hotkey (Update #50). Does nothing when no break is running,
+    so a press at any other time can never skip a later break."""
+    if not (state.is_running and state.in_research_break):
+        return
+    skip_break_event.set()
+    state.status = "Skipping the research break..."
+
+
+def show_lookback_stopped_message(pending):
+    """Tells the person what to fix by hand when Stop was pressed in the middle
+    of a second revision pass (Update #34)."""
+    if pending.get("stage") == "cursor":
+        body = (
+            "Typing was stopped while the cursor was going back to the end of the "
+            "paragraph.\n\nThe text itself is correct, but the cursor may be in the middle "
+            "of the paragraph. Click at the very end of the typed text before you resume."
+        )
+    else:
+        body = (
+            "Typing was stopped before a reworded word was fixed.\n\n"
+            f"The text on screen has \"{pending.get('draft', '')}\" where your file says "
+            f"\"{pending.get('original', '')}\". Change it back by hand, then click at the "
+            "very end of the typed text before you resume."
+        )
+    messagebox.showinfo("Stopped in the middle of a word change", body)
+
+
+def show_select_retype_stopped_message(pending):
+    """Tells the person what to fix by hand when Stop was pressed in the middle
+    of a select and retype (Update #35). The word never counted as typed, so
+    after it is deleted, resuming types it again."""
+    body = (
+        "Typing was stopped while a word was being selected and retyped.\n\n"
+        f"The last word on screen may be \"{pending.get('draft', '')}\" (it may still be "
+        f"highlighted), or only the start of \"{pending.get('original', '')}\". Delete "
+        "that last word by hand, then click right after the last correct character "
+        "before you resume."
+    )
+    messagebox.showinfo("Stopped in the middle of a word change", body)
+
+
+def stop_typing():
+    global preview_text_widget
+    was_running = state.is_running
+    was_preview = state.settings.get("preview_mode", False)
+    if state.status.startswith("Waiting to start"):
+        # Stopping during a scheduled wait cancels the schedule (Update #46).
+        enable_scheduled_start_var.set(False)
+    state.is_running = False
+    stop_event.set()
+    pause_event.clear()
+    # Put back any key Key Press Timing is holding down (Update #59).
+    release_all_held_keys()
+    focus_lost_event.clear()
+    skip_break_event.clear()
+    refresh_skip_break_button()
+
+    btn_start.configure(state=tk.NORMAL)
+    btn_preview.configure(state=tk.NORMAL)
+    btn_pause.configure(state=tk.DISABLED, text="Pause Typing")
+    btn_stop.configure(state=tk.DISABLED)
+
+    if state.status != "Finished!":
+        state.status = "Stopped"
+        if was_running and not was_preview:
+            log_event("session_end", "stopped")
+            input_path = state.settings.get("input_path", "")
+            if input_path and 0 < state.chars_typed < state.total_chars:
+                clean_text = state.clean_text
+                prefix_hash = hash_clean_prefix(clean_text, state.chars_typed) if clean_text else None
+                save_resume_state(input_path, state.chars_typed, state.total_chars, prefix_hash)
+    else:
+        if not was_preview:
+            input_path = state.settings.get("input_path", "")
+            if input_path:
+                clear_resume_state(input_path)
+        notify_finished()
+
+    if state.logging_enabled and state.log_entries and not was_preview:
+        export_log(auto=True)
+
+    if was_preview:
+        preview_text_widget = None
+
+    # Tell the person which mistakes were purposely left for them (Update #24).
+    if was_running and state.left_mistakes:
+        open_left_mistake_report()
+
+    # A text check that found a difference, or could not read the text back,
+    # opens its report (Update #51). A check that matched needs no window.
+    if was_running and any(item["status"] != "match" for item in state.text_check_results):
+        open_text_check_report()
+
+    # A second revision pass was cut off by Stop (Update #34).
+    pending_lookback = state.lookback_pending
+    state.lookback_pending = None
+    if was_running and not was_preview and pending_lookback:
+        show_lookback_stopped_message(pending_lookback)
+
+    # A select and retype was cut off by Stop (Update #35).
+    pending_select = state.select_retype_pending
+    state.select_retype_pending = None
+    if was_running and not was_preview and pending_select:
+        show_select_retype_stopped_message(pending_select)
+
+    run_on_main_thread(refresh_resume_status)
+
+
+# --------------------------------------------
+# WINDOW SELECTION (target window lock)
+# --------------------------------------------
+def refresh_window_list():
+    if not HAS_PYGETWINDOW:
+        return
+    titles = [t for t in gw.getAllTitles() if t.strip()]
+    seen = set()
+    unique_titles = []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            unique_titles.append(t)
+    window_combo.configure(values=unique_titles or [""])
+    if unique_titles and not window_var.get():
+        window_var.set(unique_titles[0])
+
+
+# --------------------------------------------
+# HOTKEY BINDING (debounced -- applied explicitly, not per keystroke)
+# --------------------------------------------
+def apply_hotkeys(event=None):
+    keyboard.unhook_all()
+    warnings = []
+    bindings = [
+        (hotkey_start_var.get().strip(), start_typing, "Start"),
+        (hotkey_pause_var.get().strip(), toggle_pause, "Pause"),
+        (hotkey_stop_var.get().strip(), stop_typing, "Stop"),
+        (hotkey_skip_break_var.get().strip(), skip_research_break, "Skip Break"),
+    ]
+    for hotkey, func, label in bindings:
+        if not hotkey:
+            continue
+        try:
+            # The `keyboard` library fires this callback on its own
+            # background listener thread, not the main thread -- so
+            # it must only ever enqueue the action, never call the
+            # GUI function directly.
+            keyboard.add_hotkey(hotkey, lambda f=func: run_on_main_thread(f))
+        except Exception:
+            warnings.append(f"{label} ('{hotkey}')")
+    hotkey_warning_var.set("\u26a0 Invalid hotkey(s): " + ", ".join(warnings) if warnings else "")
+
+
+# --------------------------------------------
+# TYPING PROFILES (save / load settings as JSON)
+# --------------------------------------------
+def get_base_dir():
+    """Resolve the app's own directory whether running as a plain
+    .py script or as a PyInstaller-frozen .exe (this project ships
+    an amanuensis.spec / dist build, so both cases matter)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+PROFILE_DIR = os.path.join(get_base_dir(), "profiles")
+LAST_SETTINGS_PATH = os.path.join(get_base_dir(), "last_settings.json")
+RESUME_STATE_PATH = os.path.join(get_base_dir(), "resume_state.json")
+
+
+def get_current_settings_snapshot():
+    return {
+        "min_delay": min_delay_var.get(),
+        "max_delay": max_delay_var.get(),
+        "hotkey_start": hotkey_start_var.get(),
+        "hotkey_pause": hotkey_pause_var.get(),
+        "hotkey_stop": hotkey_stop_var.get(),
+        "hotkey_skip_break": hotkey_skip_break_var.get(),
+        "mistake_min_words": mistake_min_var.get(),
+        "mistake_max_words": mistake_max_var.get(),
+        "break_min_paragraphs": break_min_var.get(),
+        "break_max_paragraphs": break_max_var.get(),
+        "break_duration_min_seconds": break_duration_min_var.get(),
+        "break_duration_max_seconds": break_duration_max_var.get(),
+        "enable_mistakes": enable_mistakes_var.get(),
+        "enable_breaks": enable_breaks_var.get(),
+        "log_enabled": log_enabled_var.get(),
+        "enable_typos": enable_typos_var.get(),
+        "typo_chance": typo_chance_var.get(),
+        "use_extra_typos": use_extra_typos_var.get(),
+        "enable_capital_slips": enable_capital_slips_var.get(),
+        "enable_paraphrase": enable_paraphrase_var.get(),
+        "paraphrase_chance": paraphrase_chance_var.get(),
+        "enable_lookback_edit": enable_lookback_edit_var.get(),
+        "lookback_edit_chance": lookback_edit_chance_var.get(),
+        "enable_select_retype": enable_select_retype_var.get(),
+        "select_retype_chance": select_retype_chance_var.get(),
+        "enable_overshoot": enable_overshoot_var.get(),
+        "overshoot_chance": overshoot_chance_var.get(),
+        "enable_key_hold": enable_key_hold_var.get(),
+        "key_hold_min_ms": key_hold_min_ms_var.get(),
+        "key_hold_max_ms": key_hold_max_ms_var.get(),
+        "enable_shift_hold": enable_shift_hold_var.get(),
+        "enable_key_overlap": enable_key_overlap_var.get(),
+        "key_overlap_chance": key_overlap_chance_var.get(),
+        "paragraph_pause_min": paragraph_pause_min_var.get(),
+        "paragraph_pause_max": paragraph_pause_max_var.get(),
+        "sentence_pause_min": sentence_pause_min_var.get(),
+        "sentence_pause_max": sentence_pause_max_var.get(),
+        "input_path": input_path_var.get(),
+        "file_queue": get_queue_files(),
+        "enable_auto_profile": enable_auto_profile_var.get(),
+        "auto_profile_rules": get_auto_profile_rules(),
+        "enable_notify": enable_notify_var.get(),
+        "enable_sound": enable_sound_var.get(),
+        "alert_on_auto_pause": alert_on_auto_pause_var.get(),
+        "auto_pause_activity": auto_pause_activity_var.get(),
+        "activity_sensitivity": activity_sensitivity_var.get(),
+        "enable_fatigue": enable_fatigue_var.get(),
+        "fatigue_strength": fatigue_strength_var.get(),
+        "enable_finger_timing": enable_finger_timing_var.get(),
+        "enable_typing_moods": enable_typing_moods_var.get(),
+        "typing_mood_strength": typing_mood_strength_var.get(),
+        "enable_difficulty_pauses": enable_difficulty_pauses_var.get(),
+        "difficulty_pause_strength": difficulty_pause_strength_var.get(),
+        "enable_typing_bursts": enable_typing_bursts_var.get(),
+        "burst_pause_strength": burst_pause_strength_var.get(),
+        "enable_decision_pauses": enable_decision_pauses_var.get(),
+        "decision_pause_strength": decision_pause_strength_var.get(),
+        "enable_uneven_rhythm": enable_uneven_rhythm_var.get(),
+        "rhythm_strength": rhythm_strength_var.get(),
+        "enable_writing_habits": enable_writing_habits_var.get(),
+        "writing_habit_strength": writing_habit_strength_var.get(),
+        "enable_essay_pace": enable_essay_pace_var.get(),
+        "essay_pace_strength": essay_pace_strength_var.get(),
+        "enable_warmup": enable_warmup_var.get(),
+        "warmup_strength": warmup_strength_var.get(),
+        "start_countdown_seconds": start_countdown_seconds_var.get(),
+        "enable_scheduled_start": enable_scheduled_start_var.get(),
+        "scheduled_start_time": scheduled_start_time_var.get(),
+        "enable_revision_clusters": enable_revision_clusters_var.get(),
+        "cluster_strength": cluster_strength_var.get(),
+        "revision_style": revision_style_var.get(),
+        "editor_mode": editor_mode_var.get(),
+        "enable_target_time": enable_target_time_var.get(),
+        "target_time_hours": target_hours_var.get(),
+        "target_time_minutes": target_minutes_var.get(),
+        "enable_pause_markers": enable_pause_markers_var.get(),
+        "enable_format_markers": enable_format_markers_var.get(),
+        "enable_smart_fixes": enable_smart_fixes_var.get(),
+        "smart_fix_spacing": smart_fix_spacing_var.get(),
+        "smart_fix_punctuation": smart_fix_punctuation_var.get(),
+        "smart_fix_capitalization": smart_fix_capitalization_var.get(),
+        "smart_fix_repeated_words": smart_fix_repeated_words_var.get(),
+        "smart_fix_visible_chance": smart_fix_visible_chance_var.get(),
+        "enable_leave_mistakes": enable_leave_mistakes_var.get(),
+        "leave_mistake_count": leave_mistake_count_var.get(),
+        "leave_mistakes_typos": leave_mistakes_typos_var.get(),
+        "leave_mistakes_commas": leave_mistakes_commas_var.get(),
+        "leave_mistakes_punctuation": leave_mistakes_punctuation_var.get(),
+        "enable_update_check": enable_update_check_var.get(),
+        "skipped_update_version": skipped_update_version_var.get(),
+        "theme": theme_var.get(),
+        "text_size_percent": clamp_text_size_percent(text_size_percent_var.get()),
+        "check_typed_text": check_typed_text_var.get(),
+        "preview_speed": preview_speed_label(clamp_preview_speed(preview_speed_var.get())),
+    }
+
+
+def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
+    """Puts saved settings into the window. include_files=False ignores the
+    personal parts of the data (the batch queue and the Auto Profile rules),
+    which is what loading a shared profile does. rebind_hotkeys=False leaves
+    the hotkey bindings alone (used when a profile is auto-picked at the
+    moment Start is pressed). Malformed or non-dictionary data is ignored so a
+    damaged profile or hand-edited settings file cannot crash the app."""
+    if not isinstance(data, dict):
+        return
+
+    min_delay_var.set(data.get("min_delay", "0.05"))
+    max_delay_var.set(data.get("max_delay", "0.15"))
+    hotkey_start_var.set(data.get("hotkey_start", "f8"))
+    hotkey_pause_var.set(data.get("hotkey_pause", "f9"))
+    hotkey_stop_var.set(data.get("hotkey_stop", "esc"))
+    hotkey_skip_break_var.set(data.get("hotkey_skip_break", "ctrl+alt+b"))
+    mistake_min_var.set(data.get("mistake_min_words", "100"))
+    mistake_max_var.set(data.get("mistake_max_words", "200"))
+    break_min_var.set(data.get("break_min_paragraphs", "3"))
+    break_max_var.set(data.get("break_max_paragraphs", "6"))
+    break_duration_min_var.set(data.get("break_duration_min_seconds", "60"))
+    break_duration_max_var.set(data.get("break_duration_max_seconds", "180"))
+    enable_mistakes_var.set(data.get("enable_mistakes", True))
+    enable_breaks_var.set(data.get("enable_breaks", True))
+    log_enabled_var.set(data.get("log_enabled", False))
+    enable_typos_var.set(data.get("enable_typos", True))
+    typo_chance_var.set(data.get("typo_chance", "4"))
+    use_extra_typos_var.set(data.get("use_extra_typos", False))
+    enable_capital_slips_var.set(bool(data.get("enable_capital_slips", True)))
+    enable_paraphrase_var.set(data.get("enable_paraphrase", True))
+    paraphrase_chance_var.set(data.get("paraphrase_chance", "15"))
+    enable_lookback_edit_var.set(bool(data.get("enable_lookback_edit", False)))
+    lookback_edit_chance_var.set(str(data.get("lookback_edit_chance", "25")))
+    enable_select_retype_var.set(bool(data.get("enable_select_retype", False)))
+    select_retype_chance_var.set(str(data.get("select_retype_chance", "20")))
+    enable_overshoot_var.set(bool(data.get("enable_overshoot", True)))
+    overshoot_chance_var.set(str(data.get("overshoot_chance", "30")))
+    enable_key_hold_var.set(bool(data.get("enable_key_hold", False)))
+    key_hold_min_ms_var.set(str(data.get("key_hold_min_ms", "40")))
+    key_hold_max_ms_var.set(str(data.get("key_hold_max_ms", "110")))
+    enable_shift_hold_var.set(bool(data.get("enable_shift_hold", True)))
+    enable_key_overlap_var.set(bool(data.get("enable_key_overlap", False)))
+    key_overlap_chance_var.set(str(data.get("key_overlap_chance", "30")))
+    paragraph_pause_min_var.set(data.get("paragraph_pause_min", "10"))
+    paragraph_pause_max_var.set(data.get("paragraph_pause_max", "20"))
+    sentence_pause_min_var.set(data.get("sentence_pause_min", "5"))
+    sentence_pause_max_var.set(data.get("sentence_pause_max", "7"))
+    enable_notify_var.set(data.get("enable_notify", True))
+    enable_sound_var.set(data.get("enable_sound", True))
+    alert_on_auto_pause_var.set(bool(data.get("alert_on_auto_pause", False)))
+    auto_pause_activity_var.set(data.get("auto_pause_activity", False))
+    activity_sensitivity_var.set(str(data.get("activity_sensitivity", "20")))
+    enable_fatigue_var.set(data.get("enable_fatigue", False))
+    fatigue_strength_var.set(str(data.get("fatigue_strength", "15")))
+    enable_finger_timing_var.set(bool(data.get("enable_finger_timing", True)))
+    enable_typing_moods_var.set(bool(data.get("enable_typing_moods", True)))
+    typing_mood_strength_var.set(str(data.get("typing_mood_strength", "100")))
+    enable_difficulty_pauses_var.set(bool(data.get("enable_difficulty_pauses", True)))
+    difficulty_pause_strength_var.set(str(data.get("difficulty_pause_strength", "100")))
+    enable_typing_bursts_var.set(bool(data.get("enable_typing_bursts", True)))
+    burst_pause_strength_var.set(str(data.get("burst_pause_strength", "100")))
+    enable_decision_pauses_var.set(bool(data.get("enable_decision_pauses", True)))
+    decision_pause_strength_var.set(str(data.get("decision_pause_strength", "100")))
+    enable_uneven_rhythm_var.set(bool(data.get("enable_uneven_rhythm", True)))
+    rhythm_strength_var.set(str(data.get("rhythm_strength", "100")))
+    enable_writing_habits_var.set(bool(data.get("enable_writing_habits", True)))
+    writing_habit_strength_var.set(str(data.get("writing_habit_strength", "100")))
+    enable_essay_pace_var.set(bool(data.get("enable_essay_pace", True)))
+    essay_pace_strength_var.set(str(data.get("essay_pace_strength", "100")))
+    enable_warmup_var.set(bool(data.get("enable_warmup", True)))
+    warmup_strength_var.set(str(data.get("warmup_strength", "100")))
+    start_countdown_seconds_var.set(
+        str(clamp_start_countdown(data.get("start_countdown_seconds", START_COUNTDOWN_DEFAULT)))
+    )
+    enable_revision_clusters_var.set(bool(data.get("enable_revision_clusters", True)))
+    cluster_strength_var.set(str(data.get("cluster_strength", "100")))
+    revision_style_var.set(normalize_cluster_style(data.get("revision_style", CLUSTER_STYLE_MIXED)))
+    editor_mode_var.set(normalize_editor_mode(data.get("editor_mode", EDITOR_MODE_PLAIN)))
+    enable_target_time_var.set(bool(data.get("enable_target_time", False)))
+    target_hours_var.set(str(data.get("target_time_hours", "2")))
+    target_minutes_var.set(str(data.get("target_time_minutes", "0")))
+    enable_pause_markers_var.set(data.get("enable_pause_markers", True))
+    enable_format_markers_var.set(bool(data.get("enable_format_markers", True)))
+    enable_smart_fixes_var.set(data.get("enable_smart_fixes", False))
+    smart_fix_spacing_var.set(data.get("smart_fix_spacing", True))
+    smart_fix_punctuation_var.set(data.get("smart_fix_punctuation", True))
+    smart_fix_capitalization_var.set(data.get("smart_fix_capitalization", True))
+    smart_fix_repeated_words_var.set(data.get("smart_fix_repeated_words", True))
+    smart_fix_visible_chance_var.set(str(data.get("smart_fix_visible_chance", "50")))
+    enable_leave_mistakes_var.set(data.get("enable_leave_mistakes", False))
+    leave_mistake_count_var.set(str(data.get("leave_mistake_count", "3")))
+    leave_mistakes_typos_var.set(data.get("leave_mistakes_typos", True))
+    leave_mistakes_commas_var.set(data.get("leave_mistakes_commas", True))
+    leave_mistakes_punctuation_var.set(data.get("leave_mistakes_punctuation", True))
+    enable_update_check_var.set(bool(data.get("enable_update_check", True)))
+    skipped_update_version_var.set(str(data.get("skipped_update_version", "")))
+    saved_theme = data.get("theme", "light")
+    if isinstance(saved_theme, str) and saved_theme in ("light", "dark"):
+        theme_var.set(saved_theme)
+        if "btn_theme_toggle" in globals():
+            btn_theme_toggle.configure(text=f"Theme: {saved_theme.capitalize()}")
+    if include_files and "file_queue" in data and isinstance(data["file_queue"], (list, tuple)):
+        file_queue_var.set(list(data["file_queue"]))
+    if include_files:
+        # The text size belongs to this computer, so shared profiles never carry
+        # it (Update #48). Older files load as 100%.
+        text_size_percent_var.set(
+            f"{clamp_text_size_percent(data.get('text_size_percent', TEXT_SIZE_DEFAULT))}%"
+        )
+        # Reading the text back uses this computer's clipboard, so it is never
+        # saved in shared profiles either (Update #51). Older files load as off.
+        check_typed_text_var.set(bool(data.get("check_typed_text", False)))
+        # The preview speed is a choice for this computer, so shared profiles
+        # never carry it, and loading one leaves the speed as it is (Update #53).
+        # Older settings files without it keep the 1x default.
+        if "preview_speed" in data:
+            preview_speed_var.set(preview_speed_label(clamp_preview_speed(data["preview_speed"])))
+        enable_auto_profile_var.set(bool(data.get("enable_auto_profile", False)))
+        set_auto_profile_rules(data.get("auto_profile_rules", []))
+        # A scheduled start belongs to this computer and this moment, so shared
+        # profiles never carry it (Update #46). Older files load as off.
+        loaded_clock = parse_clock_time(data.get("scheduled_start_time", ""))
+        scheduled_start_time_var.set(
+            format_clock_time(loaded_clock[0], loaded_clock[1]) if loaded_clock else SCHEDULED_START_DEFAULT
+        )
+        enable_scheduled_start_var.set(bool(data.get("enable_scheduled_start", False)))
+    if rebind_hotkeys:
+        apply_hotkeys()
+
+
+def save_profile():
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    path = filedialog.asksaveasfilename(
+        title="Save Profile",
+        initialdir=PROFILE_DIR,
+        defaultextension=".json",
+        filetypes=[("JSON files", "*.json")],
+    )
+    if not path:
+        return
+    try:
+        # Profiles are made to be shared, so they never carry folder paths or
+        # the Auto Profile rules (which hold window title words).
+        profile_data = get_current_settings_snapshot()
+        profile_data.pop("input_path", None)
+        profile_data.pop("file_queue", None)
+        profile_data.pop("enable_auto_profile", None)
+        profile_data.pop("auto_profile_rules", None)
+        profile_data.pop("enable_scheduled_start", None)
+        profile_data.pop("scheduled_start_time", None)
+        profile_data.pop("text_size_percent", None)
+        profile_data.pop("check_typed_text", None)
+        profile_data.pop("preview_speed", None)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile_data, f, indent=2)
+        messagebox.showinfo("Profile Saved", f"Profile saved to:\n{path}")
+    except OSError as e:
+        messagebox.showerror("Save Failed", str(e))
+
+
+def load_profile():
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    path = filedialog.askopenfilename(
+        title="Load Profile",
+        initialdir=PROFILE_DIR,
+        filetypes=[("JSON files", "*.json")],
+    )
+    if not path:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            messagebox.showerror("Load Failed", "That file is not an Amanuensis profile.")
+            return
+        apply_settings_snapshot(data, include_files=False)
+        messagebox.showinfo("Profile Loaded", f"Profile loaded from:\n{path}")
+    except (OSError, ValueError, TypeError, AttributeError, tk.TclError) as e:
+        messagebox.showerror("Load Failed", str(e))
+
+
+# --------------------------------------------
+# AUTO PROFILE BY WINDOW (Update #30)
+# --------------------------------------------
+# A rule says: if the target window's title contains these words, load this
+# saved profile. The rules live as JSON text in one tk variable so they fit the
+# normal settings pattern. They hold window title words, which can be personal,
+# so they are never saved into a profile and are ignored when one is loaded.
+MAX_AUTO_PROFILE_RULES = 20
+MAX_AUTO_PROFILE_KEYWORD_LENGTH = 60
+MAX_PROFILE_FILE_BYTES = 1000000
+
+# An auto-picked profile never changes these. They belong to the app or to the
+# current run, not to a typing style.
+AUTO_PROFILE_KEEP_KEYS = (
+    "hotkey_start",
+    "hotkey_pause",
+    "hotkey_stop",
+    "hotkey_skip_break",
+    "theme",
+    "enable_update_check",
+    "skipped_update_version",
+    "input_path",
+    "file_queue",
+    "enable_auto_profile",
+    "auto_profile_rules",
+    "enable_scheduled_start",
+    "scheduled_start_time",
+    "text_size_percent",
+    "check_typed_text",
+    "preview_speed",
+)
+
+
+def is_safe_profile_name(name):
+    """True only for a plain '.json' file name with no folder part, so a rule
+    can only ever point at a file inside the profiles folder."""
+    if not isinstance(name, str) or not name:
+        return False
+    if name != os.path.basename(name) or name in (".", ".."):
+        return False
+    if any(ch in name for ch in ("/", "\\", ":", "\x00")):
+        return False
+    return name.lower().endswith(".json") and len(name) > len(".json")
+
+
+def clean_auto_profile_rules(value):
+    """Turns saved data (a list, or JSON text holding a list) into a clean list
+    of {"keyword": ..., "profile": ...} rules. Anything malformed is skipped,
+    because settings files are untrusted input."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, RecursionError):
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    rules = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        keyword = item.get("keyword")
+        profile_name = item.get("profile")
+        if not isinstance(keyword, str) or not isinstance(profile_name, str):
+            continue
+        keyword = keyword.strip()
+        if not keyword or len(keyword) > MAX_AUTO_PROFILE_KEYWORD_LENGTH:
+            continue
+        if not is_safe_profile_name(profile_name):
+            continue
+        rules.append({"keyword": keyword, "profile": profile_name})
+        if len(rules) >= MAX_AUTO_PROFILE_RULES:
+            break
+    return rules
+
+
+def get_auto_profile_rules():
+    """The current rules as a clean list of dictionaries."""
+    return clean_auto_profile_rules(auto_profile_rules_var.get())
+
+
+def set_auto_profile_rules(rules):
+    """Stores rules (cleaned first). Changing the variable also refreshes the
+    list shown on the Window tab."""
+    auto_profile_rules_var.set(json.dumps(clean_auto_profile_rules(rules)))
+
+
+def list_profile_files():
+    """Names of the saved profile files inside the profiles folder."""
+    try:
+        names = os.listdir(PROFILE_DIR)
+    except OSError:
+        return []
+    good_names = [
+        name for name in names
+        if is_safe_profile_name(name) and os.path.isfile(os.path.join(PROFILE_DIR, name))
+    ]
+    return sorted(good_names, key=str.lower)
+
+
+def refresh_auto_profile_choices():
+    """Refills the profile dropdown from the profiles folder."""
+    names = list_profile_files()
+    auto_profile_combo.configure(values=names or [""])
+    if auto_profile_choice_var.get() not in names:
+        auto_profile_choice_var.set(names[0] if names else "")
+
+
+def refresh_auto_profile_listbox(*args):
+    """Redraws the rule list on the Window tab from the saved rules."""
+    if "auto_profile_listbox" not in globals():
+        return
+    auto_profile_listbox.delete(0, tk.END)
+    for rule in get_auto_profile_rules():
+        auto_profile_listbox.insert(tk.END, f'Title has "{rule["keyword"]}"  ->  {rule["profile"]}')
+
+
+def add_auto_profile_rule():
+    """Adds the typed words and the chosen profile as a new rule."""
+    if state.is_running:
+        return
+    keyword = auto_profile_keyword_var.get().strip()
+    profile_name = auto_profile_choice_var.get().strip()
+    if not keyword:
+        messagebox.showinfo("Add Rule", "Type some words from the window's title first, like Google Docs.")
+        return
+    if len(keyword) > MAX_AUTO_PROFILE_KEYWORD_LENGTH:
+        messagebox.showinfo(
+            "Add Rule", f"Please use {MAX_AUTO_PROFILE_KEYWORD_LENGTH} characters or fewer for the title words."
+        )
+        return
+    if not profile_name:
+        messagebox.showinfo(
+            "Add Rule",
+            "Pick a saved profile first. Save one with 'Save Profile...' on the Data tab, "
+            "keep it in the profiles folder, then click Refresh.",
+        )
+        return
+    rules = get_auto_profile_rules()
+    if len(rules) >= MAX_AUTO_PROFILE_RULES:
+        messagebox.showinfo("Add Rule", f"You can have up to {MAX_AUTO_PROFILE_RULES} rules. Remove one first.")
+        return
+    rules.append({"keyword": keyword, "profile": profile_name})
+    set_auto_profile_rules(rules)
+    auto_profile_keyword_var.set("")
+
+
+def remove_selected_auto_profile_rules():
+    """Removes the highlighted rules from the list."""
+    if state.is_running:
+        return
+    chosen = set(auto_profile_listbox.curselection())
+    if not chosen:
+        return
+    rules = get_auto_profile_rules()
+    set_auto_profile_rules([rule for index, rule in enumerate(rules) if index not in chosen])
+
+
+def get_target_window_title():
+    """The title of the window the person is typing into: the locked window when
+    Lock typing is on, otherwise the window that is active right now. Returns an
+    empty string when it cannot be known (including when the active window is
+    Amanuensis itself, which happens when the Start button was clicked)."""
+    if not HAS_PYGETWINDOW:
+        return ""
+    if lock_window_var.get():
+        return window_var.get().strip()
+    try:
+        active = gw.getActiveWindow()
+        title = active.title if active else ""
+    except Exception:
+        return ""
+    if not isinstance(title, str) or title == window.title():
+        return ""
+    return title.strip()
+
+
+def find_auto_profile_rule(title, rules):
+    """The first rule whose words appear in the title (capitals ignored), or None."""
+    lowered_title = title.lower()
+    for rule in rules:
+        if rule["keyword"].lower() in lowered_title:
+            return rule
+    return None
+
+
+def read_auto_profile_file(profile_name):
+    """Reads a profile from the profiles folder. Returns its data as a
+    dictionary, or None if it is missing, too big, or not a profile."""
+    if not is_safe_profile_name(profile_name):
+        return None
+    path = os.path.join(PROFILE_DIR, profile_name)
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > MAX_PROFILE_FILE_BYTES:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_auto_profile(profile_name):
+    """Puts a saved profile into the settings. Hotkeys, theme, update settings,
+    files, and the Auto Profile rules stay as they are. Returns True on success.
+    If anything goes wrong part way, the earlier settings are put back."""
+    data = read_auto_profile_file(profile_name)
+    if data is None:
+        return False
+    backup = get_current_settings_snapshot()
+    merged = dict(backup)
+    for key, value in data.items():
+        if key in backup and key not in AUTO_PROFILE_KEEP_KEYS:
+            merged[key] = value
+    try:
+        apply_settings_snapshot(merged, include_files=False, rebind_hotkeys=False)
+    except (ValueError, TypeError, AttributeError, tk.TclError):
+        apply_settings_snapshot(backup, include_files=False, rebind_hotkeys=False)
+        return False
+    return True
+
+
+# --------------------------------------------
+# STARTER PROFILES (Update #47)
+# --------------------------------------------
+# A few built-in typing styles so a new person can start with a good setup.
+# They live here in the code, not in the profiles folder, so they never show
+# up as files and cannot be changed or damaged. Each one lists only the
+# settings that differ from the app's defaults. Loading one puts every other
+# typing setting back to its default first. Keys must match the names used by
+# get_current_settings_snapshot(), and values are written the same way the
+# snapshot stores them (text for boxes, True or False for checkboxes).
+STARTER_PROFILES = {
+    "Careful student": {
+        "description": (
+            "A steady, careful pace with thinking pauses, a few typos fixed right away, "
+            "regular sentence reworks, and a second look back at earlier words. Research "
+            "breaks come every few paragraphs."
+        ),
+        "settings": {
+            "min_delay": "0.08",
+            "max_delay": "0.22",
+            "enable_typos": True,
+            "typo_chance": "3",
+            "use_extra_typos": False,
+            "enable_mistakes": True,
+            "mistake_min_words": "80",
+            "mistake_max_words": "160",
+            "enable_paraphrase": True,
+            "paraphrase_chance": "20",
+            "enable_lookback_edit": True,
+            "lookback_edit_chance": "30",
+            "enable_breaks": True,
+            "break_min_paragraphs": "2",
+            "break_max_paragraphs": "4",
+            "break_duration_min_seconds": "45",
+            "break_duration_max_seconds": "120",
+            "paragraph_pause_min": "12",
+            "paragraph_pause_max": "25",
+            "sentence_pause_min": "3",
+            "sentence_pause_max": "6",
+            "difficulty_pause_strength": "120",
+            "decision_pause_strength": "120",
+        },
+    },
+    "Fast typist": {
+        "description": (
+            "Quick, confident typing with short pauses and only a few reworks. Typos are "
+            "noticed a little later, and breaks are short and far apart."
+        ),
+        "settings": {
+            "min_delay": "0.03",
+            "max_delay": "0.09",
+            "enable_typos": True,
+            "typo_chance": "3",
+            "use_extra_typos": True,
+            "enable_mistakes": True,
+            "mistake_min_words": "200",
+            "mistake_max_words": "400",
+            "enable_paraphrase": True,
+            "paraphrase_chance": "5",
+            "enable_breaks": True,
+            "break_min_paragraphs": "5",
+            "break_max_paragraphs": "9",
+            "break_duration_min_seconds": "30",
+            "break_duration_max_seconds": "60",
+            "paragraph_pause_min": "3",
+            "paragraph_pause_max": "6",
+            "sentence_pause_min": "1",
+            "sentence_pause_max": "2",
+            "burst_pause_strength": "60",
+            "difficulty_pause_strength": "60",
+            "decision_pause_strength": "50",
+            "essay_pace_strength": "60",
+        },
+    },
+    "Tired late night": {
+        "description": (
+            "Slow, uneven typing that gets slower over a long run. More typos and reworks, "
+            "second thoughts about earlier words, longer pauses, and long breaks every few "
+            "paragraphs."
+        ),
+        "settings": {
+            "min_delay": "0.10",
+            "max_delay": "0.30",
+            "enable_typos": True,
+            "typo_chance": "6",
+            "use_extra_typos": True,
+            "enable_mistakes": True,
+            "mistake_min_words": "60",
+            "mistake_max_words": "120",
+            "enable_paraphrase": True,
+            "paraphrase_chance": "20",
+            "enable_lookback_edit": True,
+            "lookback_edit_chance": "35",
+            "enable_select_retype": True,
+            "select_retype_chance": "20",
+            "enable_breaks": True,
+            "break_min_paragraphs": "2",
+            "break_max_paragraphs": "4",
+            "break_duration_min_seconds": "90",
+            "break_duration_max_seconds": "240",
+            "paragraph_pause_min": "15",
+            "paragraph_pause_max": "30",
+            "sentence_pause_min": "6",
+            "sentence_pause_max": "10",
+            "enable_fatigue": True,
+            "fatigue_strength": "30",
+            "typing_mood_strength": "140",
+            "warmup_strength": "140",
+            "cluster_strength": "120",
+            "burst_pause_strength": "120",
+            "difficulty_pause_strength": "130",
+            "decision_pause_strength": "130",
+        },
+    },
+    "Hands-free dictation": {
+        "description": (
+            "A steady, even speed with no mistakes, no reworks, and no breaks, for text you "
+            "already prepared with speech-to-text. Every realism setting is off, so the text "
+            "is typed straight through."
+        ),
+        "settings": {
+            "min_delay": "0.06",
+            "max_delay": "0.10",
+            "enable_typos": False,
+            "use_extra_typos": False,
+            "enable_capital_slips": False,
+            "enable_mistakes": False,
+            "enable_paraphrase": False,
+            "enable_lookback_edit": False,
+            "enable_select_retype": False,
+            "enable_overshoot": False,
+            "enable_revision_clusters": False,
+            "enable_breaks": False,
+            "paragraph_pause_min": "1",
+            "paragraph_pause_max": "2",
+            "sentence_pause_min": "0.2",
+            "sentence_pause_max": "0.5",
+            "enable_fatigue": False,
+            "enable_finger_timing": False,
+            "enable_typing_moods": False,
+            "enable_difficulty_pauses": False,
+            "enable_typing_bursts": False,
+            "enable_decision_pauses": False,
+            "enable_uneven_rhythm": False,
+            "enable_writing_habits": False,
+            "enable_essay_pace": False,
+            "enable_warmup": False,
+        },
+    },
+}
+
+# A starter profile never changes these. They belong to the app, this
+# computer, or the current run, not to a typing style.
+STARTER_PROFILE_KEEP_KEYS = AUTO_PROFILE_KEEP_KEYS + (
+    "log_enabled",
+    "enable_notify",
+    "enable_sound",
+    "alert_on_auto_pause",
+    "auto_pause_activity",
+    "activity_sensitivity",
+    "start_countdown_seconds",
+    "editor_mode",
+    "enable_target_time",
+    "target_time_hours",
+    "target_time_minutes",
+)
+
+
+def get_starter_profile_names():
+    """The names of the built-in starter profiles, in the order shown."""
+    return list(STARTER_PROFILES)
+
+
+def refresh_starter_profile_description(*_args):
+    """Shows the short description of the chosen starter profile."""
+    profile = STARTER_PROFILES.get(starter_profile_choice_var.get())
+    starter_profile_description_var.set(profile["description"] if profile else "")
+
+
+def load_starter_profile():
+    """Loads the chosen starter profile after asking. Every typing setting not
+    listed in the profile goes back to its default, while the settings in
+    STARTER_PROFILE_KEEP_KEYS stay as they are. If anything goes wrong part
+    way, the earlier settings are put back."""
+    if state.is_running:
+        messagebox.showinfo(
+            "Load Unavailable",
+            "Stop the current run before loading a starter profile.",
+        )
+        return
+    name = starter_profile_choice_var.get()
+    profile = STARTER_PROFILES.get(name)
+    if profile is None:
+        messagebox.showinfo("Pick a Starter Profile", "Choose a starter profile from the list first.")
+        return
+    if not messagebox.askyesno(
+        f"Load {name}",
+        f"Load the '{name}' starter profile?\n\n"
+        "This replaces your current typing settings (speed, mistakes, breaks, pauses, "
+        "and the realism cards).\n"
+        "Your hotkeys, theme, text size, editor type, input file, file queue, target time, start countdown, "
+        "scheduled start, Auto Profile rules, and update settings will not change.",
+    ):
+        return
+    backup = get_current_settings_snapshot()
+    merged = {key: backup[key] for key in STARTER_PROFILE_KEEP_KEYS if key in backup}
+    merged.update(profile["settings"])
+    try:
+        apply_settings_snapshot(merged, include_files=False, rebind_hotkeys=False)
+    except (ValueError, TypeError, AttributeError, tk.TclError):
+        apply_settings_snapshot(backup, include_files=False, rebind_hotkeys=False)
+        messagebox.showerror("Load Failed", "The starter profile could not be loaded, so your settings were not changed.")
+        return
+    messagebox.showinfo("Starter Profile Loaded", f"The '{name}' starter profile is now loaded.")
+
+
+def apply_auto_profile_for_start():
+    """Runs when Start is pressed, before the settings are checked. Returns
+    (keep_starting, profile_name). keep_starting is False only when the person
+    cancels because a matching profile could not be loaded. profile_name is
+    the profile that was loaded, or an empty string if none was."""
+    auto_profile_status_var.set("")
+    if not enable_auto_profile_var.get():
+        return True, ""
+    if not HAS_PYGETWINDOW:
+        auto_profile_status_var.set("Auto pick needs pygetwindow, which is not installed.")
+        return True, ""
+    rules = get_auto_profile_rules()
+    if not rules:
+        auto_profile_status_var.set("Auto pick is on, but there are no rules yet.")
+        return True, ""
+    title = get_target_window_title()
+    if not title:
+        auto_profile_status_var.set(
+            "Auto pick could not tell which window you are typing into, so your current settings were used. "
+            "Use the Start hotkey, or lock a window."
+        )
+        return True, ""
+    rule = find_auto_profile_rule(title, rules)
+    if rule is None:
+        auto_profile_status_var.set("No rule matched the target window, so your current settings were used.")
+        return True, ""
+
+    profile_name = rule["profile"]
+    if load_auto_profile(profile_name):
+        auto_profile_status_var.set(f'Last auto pick: loaded "{profile_name}" (matched "{rule["keyword"]}").')
+        return True, profile_name
+    if messagebox.askokcancel(
+        "Auto Profile Problem",
+        f"The profile '{profile_name}' could not be loaded. It may be missing, damaged, or not a profile.\n\n"
+        "Click OK to type with your current settings instead.\n"
+        "Click Cancel to stop so you can fix the rule.",
+    ):
+        auto_profile_status_var.set(f'Could not load "{profile_name}", so your current settings were used.')
+        return True, ""
+    return False, ""
+
+
+def _reset_is_blocked():
+    """Resetting settings mid-run would be confusing (the run already
+    captured its settings), so every reset is refused while a run or
+    preview is active. Returns True if the caller should stop."""
+    if state.is_running:
+        messagebox.showinfo(
+            "Reset Unavailable",
+            "Stop the current run before resetting settings.",
+        )
+        return True
+    return False
+
+
+def _apply_section_defaults(section_name):
+    """Puts every variable in one section back to the default value that
+    was captured at startup (see SECTION_DEFAULTS). Does no confirmation
+    and no running-check; callers handle both."""
+    for var, default_value in SECTION_DEFAULTS[section_name]:
+        var.set(default_value)
+    if section_name == "Hotkeys":
+        # Hotkey changes only take effect once they are re-registered.
+        apply_hotkeys()
+
+
+def reset_section(section_name):
+    """Reset ONE settings card back to its defaults, after asking the
+    user to confirm. Other cards are left exactly as they are."""
+    if _reset_is_blocked():
+        return
+    if not messagebox.askyesno(
+        f"Reset {section_name}",
+        f"Reset the '{section_name}' settings to their default values?\n\n"
+        "Only this section will change.",
+    ):
+        return
+    _apply_section_defaults(section_name)
+
+
+def reset_to_defaults():
+    """Reset EVERY settings card back to its defaults, after asking
+    for confirmation. Uses the same section list as the per-card
+    buttons. The theme, Input File, batch queue, and Target Window
+    Lock are not settings cards and are left alone."""
+    if _reset_is_blocked():
+        return
+    if not messagebox.askyesno(
+        "Reset All Settings",
+        "Reset all settings to their default values?\n\n"
+        "This will overwrite whatever you currently have entered.\n"
+        "Your theme, text size, input file, and file queue will not change.",
+    ):
+        return
+    for section_name in SECTION_DEFAULTS:
+        _apply_section_defaults(section_name)
+
+
+def save_last_settings():
+    """Best-effort auto-save of the current settings so they're
+    restored automatically next launch, with no need to use Save
+    Profile every time. Silently does nothing on failure -- this
+    should never block closing the app or starting a session."""
+    try:
+        with open(LAST_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(get_current_settings_snapshot(), f, indent=2)
+    except OSError:
+        pass
+
+
+def load_last_settings():
+    """Best-effort auto-restore of the last-used settings on launch.
+    Silently falls back to the built-in defaults if no saved
+    settings exist yet or the file can't be read."""
+    try:
+        with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return  # not a settings file, so keep the built-in defaults
+        apply_settings_snapshot(data)
+        saved_input_path = data.get("input_path")
+        if isinstance(saved_input_path, str) and saved_input_path:
+            input_path_var.set(saved_input_path)
+    except (OSError, ValueError, TypeError, AttributeError, tk.TclError):
+        pass
+
+
+def on_close():
+    stop_typing()
+    save_last_settings()
+    window.destroy()
+
+
+def make_resume_key(input_path):
+    """Return the canonical dict key for a file path: lowercase, absolute."""
+    return os.path.normcase(os.path.abspath(input_path))
+
+
+def hash_clean_prefix(clean_text, chars_typed):
+    """SHA-256 of clean_text[:chars_typed] encoded as UTF-8."""
+    prefix = clean_text[:chars_typed].encode("utf-8")
+    return hashlib.sha256(prefix).hexdigest()
+
+
+def read_resume_store():
+    """Read resume_state.json and return a v2 entries dict.
+    Migrates old v1 format ({input_path, chars_typed} at top level) on the fly.
+    Returns {} on any error or missing file -- never raises."""
+    try:
+        with open(RESUME_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    # v2 format
+    if isinstance(data, dict) and data.get("version") == 2:
+        entries = data.get("entries", {})
+        return entries if isinstance(entries, dict) else {}
+
+    # v1 migration: single-file {input_path, chars_typed} at top level
+    if isinstance(data, dict) and "input_path" in data and "chars_typed" in data:
+        old_path = data.get("input_path", "")
+        old_chars = data.get("chars_typed", 0)
+        if old_path and isinstance(old_chars, int) and old_chars > 0:
+            key = make_resume_key(old_path)
+            migrated_entry = {
+                "input_path": old_path,
+                "chars_typed": old_chars,
+                "total_chars": None,
+                "prefix_hash": None,  # unknown; skip validation
+                "saved_at": None,
+            }
+            return {key: migrated_entry}
+
+    return {}
+
+
+def write_resume_store(entries):
+    """Atomically write the entries dict to resume_state.json.
+    Uses write-to-tmp then os.replace so a crash mid-save cannot corrupt the file.
+    Holds _resume_store_lock; callers may also hold it themselves."""
+    tmp_path = RESUME_STATE_PATH + ".tmp"
+    try:
+        data = {"version": 2, "entries": entries}
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, RESUME_STATE_PATH)
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def get_clean_text_for_file(path, settings):
+    """Read `path`, prepare it the same way type_text() does (markers
+    removed, smart fixes applied when on), and return the final text that
+    gets typed. Resume checks need this to match exactly. Returns None on OSError."""
+    try:
+        raw = read_input_file_text(path)
+    except OSError:
+        return None
+    return prepare_input_text(raw, settings).clean_text
+
+
+def load_resume_entry(path):
+    """Return the saved entry dict for `path`, or None if not found."""
+    key = make_resume_key(path)
+    with _resume_store_lock:
+        entries = read_resume_store()
+    return entries.get(key)
+
+
+def validate_resume_entry(entry, clean_text):
+    """Return True if the entry is valid against clean_text.
+
+    An entry is valid when:
+      - chars_typed > 0 and chars_typed < len(clean_text)  (not at end)
+      - prefix_hash is None  (migrated old entry; skip hash check)
+      - OR prefix_hash matches SHA-256 of clean_text[:chars_typed]
+    """
+    chars_typed = entry.get("chars_typed", 0)
+    if not (0 < chars_typed < len(clean_text)):
+        return False
+    prefix_hash = entry.get("prefix_hash")
+    if prefix_hash is None:
+        return True  # migrated entry; no hash to check
+    expected = hash_clean_prefix(clean_text, chars_typed)
+    return prefix_hash == expected
+
+
+def save_resume_state(input_path, chars_typed, total_chars, prefix_hash):
+    """Persist how far into `input_path` typing got, with a hash of
+    the typed prefix for change detection on next resume."""
+    key = make_resume_key(input_path)
+    entry = {
+        "input_path": input_path,
+        "chars_typed": chars_typed,
+        "total_chars": total_chars,
+        "prefix_hash": prefix_hash,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with _resume_store_lock:
+        entries = read_resume_store()
+        entries[key] = entry
+        write_resume_store(entries)
+
+
+def clear_resume_state(input_path):
+    """Remove the saved-progress entry for `input_path` only.
+    Does nothing if there is no entry for that file."""
+    key = make_resume_key(input_path)
+    with _resume_store_lock:
+        entries = read_resume_store()
+        if key in entries:
+            del entries[key]
+            write_resume_store(entries)
+
+
+def load_resume_state_for(input_path):
+    """Thin wrapper used by preview_estimate(). Returns chars_typed or None."""
+    entry = load_resume_entry(input_path)
+    if entry is None:
+        return None
+    chars_typed = entry.get("chars_typed", 0)
+    return chars_typed if chars_typed > 0 else None
+
+
+def refresh_resume_status():
+    """Update the resume_status_var label in the Input File card.
+    Always called on the main thread. Reads the stored entries only --
+    no file I/O -- so it is fast and safe to call after every relevant change."""
+    queue_files = get_queue_files()
+
+    if queue_files:
+        # Queue mode: count how many queued files have saved progress.
+        count_with_progress = 0
+        for fpath in queue_files:
+            entry = load_resume_entry(fpath)
+            if entry and entry.get("chars_typed", 0) > 0:
+                count_with_progress += 1
+        total = len(queue_files)
+        if count_with_progress == 0:
+            resume_status_var.set(f"No saved progress for any of the {total} queued files.")
+        else:
+            resume_status_var.set(
+                f"Saved progress found for {count_with_progress} of {total} queued files."
+            )
+        return
+
+    # Single-file mode.
+    input_path = input_path_var.get().strip()
+    if not input_path:
+        resume_status_var.set("")
+        return
+
+    entry = load_resume_entry(input_path)
+    if entry is None or entry.get("chars_typed", 0) <= 0:
+        file_name = os.path.basename(input_path)
+        resume_status_var.set(f"No saved progress for '{file_name}'.")
+        return
+
+    chars_typed = entry["chars_typed"]
+    total_chars = entry.get("total_chars") or 0
+    file_name = os.path.basename(input_path)
+
+    pct_str = ""
+    if total_chars > 0:
+        pct = chars_typed / total_chars * 100
+        pct_str = f"{pct:.0f}% of "
+
+    date_str = ""
+    saved_at_str = entry.get("saved_at")
+    if saved_at_str:
+        try:
+            saved_dt = datetime.fromisoformat(saved_at_str)
+            time_part = saved_dt.strftime("%I:%M %p").lstrip("0")
+            date_str = f" (saved {saved_dt.strftime('%b')} {saved_dt.day}, {time_part})"
+        except Exception:
+            date_str = ""
+
+    resume_status_var.set(f"Saved progress: {pct_str}'{file_name}'{date_str}.")
+
+
+def clear_saved_progress():
+    """Clear resume progress entries for the current queue or single input file,
+    after asking the user for confirmation. Does nothing while typing is running."""
+    if state.is_running:
+        return
+
+    queue_files = get_queue_files()
+    if queue_files:
+        if not messagebox.askyesno(
+            "Clear Saved Progress?",
+            f"Clear saved progress for all {len(queue_files)} queued files?",
+        ):
+            return
+        for fpath in queue_files:
+            clear_resume_state(fpath)
+    else:
+        input_path = input_path_var.get().strip()
+        if not input_path:
+            return
+        file_name = os.path.basename(input_path)
+        if not messagebox.askyesno(
+            "Clear Saved Progress?",
+            f"Clear saved progress for '{file_name}'?",
+        ):
+            return
+        clear_resume_state(input_path)
+
+    refresh_resume_status()
+
+
+# --------------------------------------------
+# FILE PICKER & BATCH QUEUE
+# --------------------------------------------
+def browse_input_file():
+    if state.is_running:
+        return
+    path = filedialog.askopenfilename(
+        title="Select Input File",
+        filetypes=INPUT_FILE_TYPES,
+    )
+    if path:
+        input_path_var.set(path)
+
+
+def use_pasted_text():
+    """Write the contents of the paste Text box to a scratch file and
+    point input_path_var at it.  Every file-based feature (protected-text
+    markers, resume checkpoints, Preview Time Estimate) continues to work
+    unchanged because they all simply read whatever path input_path_var
+    holds."""
+    content = paste_text_box.get("1.0", tk.END).rstrip("\n")
+    if not content.strip():
+        messagebox.showerror("Empty Input", "Please paste or type some text before clicking \"Use Pasted Text\".")
+        return
+    scratch_path = os.path.join(get_base_dir(), "_pasted_input.txt")
+    try:
+        with open(scratch_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        err_msg = str(exc)
+        messagebox.showerror("Write Error", f"Could not save pasted text:\n{err_msg}")
+        return
+    input_path_var.set(scratch_path)
+
+
+def get_queue_files():
+    """Return a list of file paths currently in the batch queue."""
+    if "file_queue_listbox" in globals():
+        return list(file_queue_listbox.get(0, tk.END))
+    try:
+        val = file_queue_var.get()
+        if isinstance(val, (list, tuple)):
+            return list(val)
+    except (NameError, AttributeError, tk.TclError):
+        pass
+    return []
+
+
+def add_queue_files():
+    """Open multi-select file dialog and append chosen .txt, .md, and .docx files to the queue."""
+    if state.is_running:
+        return
+    paths = filedialog.askopenfilenames(
+        title="Add Files to Queue",
+        filetypes=INPUT_FILE_TYPES,
+    )
+    if paths:
+        for p in paths:
+            file_queue_listbox.insert(tk.END, p)
+        file_queue_var.set(list(file_queue_listbox.get(0, tk.END)))
+
+
+def remove_selected_queue_files():
+    """Remove highlighted items from the batch queue."""
+    if state.is_running:
+        return
+    selected_indices = list(file_queue_listbox.curselection())
+    for idx in reversed(selected_indices):
+        file_queue_listbox.delete(idx)
+    file_queue_var.set(list(file_queue_listbox.get(0, tk.END)))
+
+
+def clear_queue_files():
+    """Remove all items from the batch queue."""
+    if state.is_running:
+        return
+    file_queue_listbox.delete(0, tk.END)
+    file_queue_var.set([])
+
+
+def apply_target_wpm(event=None):
+    """Convert a target words-per-minute into a Min/Max Delay range
+    and write it directly into those fields, using the same
+    5-characters-per-word convention the live WPM stat and time
+    estimate already use. This sets raw per-character typing speed
+    only -- pauses, breaks, reworks, and typos are separate and will
+    still bring the overall session average below this number, same
+    as they already do relative to Min/Max Delay today."""
+    raw = target_wpm_var.get().strip()
+    if not raw:
+        return
+    try:
+        wpm = float(raw)
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Target WPM must be a number.")
+        return
+    if wpm <= 0 or wpm > 400:
+        messagebox.showerror("Invalid Input", "Target WPM must be between 1 and 400.")
+        return
+
+    set_delays_from_wpm(wpm)
+
+
+def set_delays_from_wpm(wpm):
+    """Write the Min Delay and Max Delay fields for a words-per-minute speed
+    (5 characters per word). The average delay matches the speed, with Min at
+    half of it and Max at one and a half times it. Used by Apply WPM and by
+    Learn My Speed, so both always give the same delays for the same speed."""
+    avg_delay = 12.0 / wpm  # seconds/char: 60s / (wpm * 5 chars-per-word)
+    min_delay_var.set(f"{avg_delay * 0.5:.3f}")
+    max_delay_var.set(f"{avg_delay * 1.5:.3f}")
+
+
+# --------------------------------------------
+# LEARN MY SPEED (Update #56)
+# --------------------------------------------
+# A small window where the person types a short paragraph. The gaps between
+# their key presses are measured, and the result fills in Target WPM and the
+# Min/Max Delay fields. Nothing is saved except those existing fields, and the
+# text typed in the window is never stored or sent anywhere.
+LEARN_SPEED_SAMPLE = (
+    "The library on the corner stays open late on Thursdays, so I usually stop by "
+    "after work. I pick a quiet table near the window, spread out my notes, and "
+    "read until the lights flicker to say it is almost closing time."
+)
+LEARN_SPEED_MIN_KEYS = 40      # measured key gaps needed before a speed is shown
+LEARN_SPEED_MIN_GAP = 0.02     # seconds; anything quicker is a keyboard glitch
+LEARN_SPEED_PAUSE_LIMIT = 2.0  # seconds; a longer gap is thinking, not typing speed
+LEARN_SPEED_MODIFIER_KEYS = (
+    "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+    "Caps_Lock", "Num_Lock", "Scroll_Lock", "Win_L", "Win_R",
+)
+learn_speed_window = None  # the open Learn My Speed window, or None
+
+
+def usable_learn_speed_gaps(gaps):
+    """Keep only the gaps (in seconds) that show real typing speed: not a
+    keyboard glitch, and not a pause to think."""
+    return [g for g in gaps if LEARN_SPEED_MIN_GAP <= g <= LEARN_SPEED_PAUSE_LIMIT]
+
+
+def measure_typing_speed(gaps):
+    """Turn the gaps between key presses (in seconds) into a words-per-minute
+    speed, using the same 5-characters-per-word rule as Target WPM. Long
+    pauses are left out because the app adds its own pauses separately, so
+    this is the raw per-character speed. Returns None until there are enough
+    measured gaps to be steady, otherwise a whole number from 1 to 400."""
+    usable = usable_learn_speed_gaps(gaps)
+    if len(usable) < LEARN_SPEED_MIN_KEYS:
+        return None
+    average_gap = sum(usable) / len(usable)
+    wpm = round(12.0 / average_gap)
+    return int(min(max(wpm, 1), 400))
+
+
+def open_learn_speed_window():
+    """Opens the Learn My Speed window (Typing Speed card, Speed tab)."""
+    global learn_speed_window
+
+    if state.is_running:
+        messagebox.showinfo(
+            "Already Running", "Stop the current session before measuring your typing speed."
+        )
+        return
+    if learn_speed_window is not None and learn_speed_window.winfo_exists():
+        learn_speed_window.lift()
+        learn_speed_window.focus_force()
+        return
+
+    learn_win = modern_toplevel(window, "Learn My Speed", "640x540", (480, 460))
+    learn_speed_window = learn_win
+    session = {"gaps": [], "last_time": None}
+    status_var = tk.StringVar(value="")
+
+    modern_label(
+        learn_win,
+        "Type the paragraph below, or any short paragraph you like, at your normal "
+        "speed. Fix mistakes the way you usually do. Amanuensis measures the time "
+        "between your key presses. The text you type here is not saved.",
+        wraplength=580,
+    ).pack(anchor="w", padx=12, pady=(10, 6))
+
+    sample_box = modern_frame(learn_win, bordered=True)
+    sample_box.pack(fill="x", padx=12, pady=(0, 8))
+    modern_label(sample_box, LEARN_SPEED_SAMPLE, kind="muted", wraplength=560).pack(
+        anchor="w", padx=10, pady=8
+    )
+
+    typing_box = modern_textbox(learn_win, height=140)
+    typing_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    modern_label(learn_win, textvariable=status_var, kind="muted", wraplength=580).pack(
+        anchor="w", padx=12, pady=(0, 8)
+    )
+
+    button_row = modern_frame(learn_win)
+    button_row.pack(anchor="w", padx=12, pady=(0, 12))
+    use_button = modern_button(button_row, "Use This Speed", lambda: use_speed(), state="disabled")
+    use_button.pack(side="left")
+    modern_button(button_row, "Start Over", lambda: start_over(), kind="neutral").pack(
+        side="left", padx=(8, 0)
+    )
+    modern_button(button_row, "Cancel", lambda: close_window(), kind="neutral").pack(
+        side="left", padx=(8, 0)
+    )
+
+    def refresh_status():
+        """Shows how far along the measuring is, and turns the Use button on
+        once there are enough key presses to be steady."""
+        measured = len(usable_learn_speed_gaps(session["gaps"]))
+        speed = measure_typing_speed(session["gaps"])
+        if speed is None:
+            status_var.set(
+                f"Keep typing. {measured} of {LEARN_SPEED_MIN_KEYS} key presses measured so far."
+            )
+            use_button.configure(state="disabled")
+        else:
+            status_var.set(
+                f"Your typing speed is about {speed} WPM. Press Use This Speed, "
+                "or keep typing for a steadier result."
+            )
+            use_button.configure(state="normal")
+
+    def on_key(event):
+        """Records the time of each key that types a character. Backspace,
+        Delete, arrows, and shortcuts break the chain, so a gap around a
+        correction or a cursor move is never counted as typing speed."""
+        if event.keysym in LEARN_SPEED_MODIFIER_KEYS:
+            return
+        character = event.char
+        if not character or not (character.isprintable() or character in ("\r", "\n")):
+            session["last_time"] = None
+            return
+        now = time.perf_counter()
+        if session["last_time"] is not None:
+            session["gaps"].append(now - session["last_time"])
+        session["last_time"] = now
+        refresh_status()
+
+    def block_paste(_event=None):
+        """Pasted text has no typing speed, so pasting is switched off here."""
+        return "break"
+
+    def start_over():
+        typing_box.delete("1.0", "end")
+        session["gaps"] = []
+        session["last_time"] = None
+        refresh_status()
+        typing_box.focus_set()
+
+    def use_speed():
+        speed = measure_typing_speed(session["gaps"])
+        if speed is None:
+            return
+        target_wpm_var.set(str(speed))
+        set_delays_from_wpm(speed)
+        close_window()
+        messagebox.showinfo(
+            "Typing Speed Measured",
+            f"Your typing speed is about {speed} WPM.\n\n"
+            "Target WPM, Min Delay, and Max Delay are filled in. Pauses, breaks, and "
+            "mistakes are separate, so your overall session speed will be a little lower.",
+        )
+
+    def close_window():
+        global learn_speed_window
+        learn_speed_window = None
+        learn_win.destroy()
+
+    typing_box.bind("<KeyPress>", on_key)
+    typing_box.bind("<<Paste>>", block_paste)
+    learn_win.protocol("WM_DELETE_WINDOW", close_window)
+    refresh_status()
+    learn_win.after(200, typing_box.focus_set)
+
+
+# --------------------------------------------
+# WINDOW SIZING (Idea #21)
+# --------------------------------------------
+# The window used to open at a fixed 520x760, which was narrower than
+# the widest content (the footer buttons and some settings text), so
+# things like the "Stop Typing" button and the Typing Speed hint text
+# were cut off until the window was dragged wider. These values are
+# only starting guesses; calculate_window_sizes() (called once after the
+# whole interface is built) measures the real content and replaces them,
+# so the size also adapts to different screens and display scaling.
+PREFERRED_WINDOW_WIDTH = 560     # never open narrower than this if the screen allows
+PREFERRED_WINDOW_HEIGHT = 820    # tabs scroll, so a taller window just shows more at once
+MIN_WINDOW_HEIGHT = 620
+SCREEN_MARGIN_WIDTH = 40         # space always left free at the sides of the screen
+SCREEN_MARGIN_HEIGHT = 100       # room for the title bar and the Windows taskbar
+TAB_SCROLLBAR_ALLOWANCE = 80     # scrollbar + notebook + card padding around tab content
+TEXT_SIZE_TAB_BAR_HEIGHT = 60    # the row of tab buttons, at the normal text size
+TEXT_SIZE_MIN_TAB_AREA = 220     # the least room the tab content needs to stay usable
+
+full_view_size = (PREFERRED_WINDOW_WIDTH, PREFERRED_WINDOW_HEIGHT)
+full_view_min = (480, MIN_WINDOW_HEIGHT)
+compact_view_size = (440, 460)
+
+compact_mode_active = False
+
+# Set by calculate_window_sizes() when the chosen text size is too big for this
+# screen (Update #48): (needed width, fixed height, max width, max height).
+text_size_fit_report = None
+
+
+def calculate_window_sizes():
+    """Measure the finished interface and size the window to fit it.
+
+    Sets the full-view and compact-view sizes, applies the full-view
+    size to the window, and centers it on the screen. Sizes are capped
+    to the screen so the window can never open bigger than the display.
+    Call this once, after every widget has been created."""
+    global full_view_size, full_view_min, compact_view_size, text_size_fit_report
+
+    window.update_idletasks()
+    screen_w = window.winfo_screenwidth()
+    screen_h = window.winfo_screenheight()
+    max_w = max(screen_w - SCREEN_MARGIN_WIDTH, 300)
+    max_h = max(screen_h - SCREEN_MARGIN_HEIGHT, 300)
+
+    # The tabs scroll vertically only, so the window must be wide enough
+    # to show the widest tab, the footer buttons, and the header.
+    tabs_w = max(frame.winfo_reqwidth() for frame in tab_frames.values()) + int(
+        TAB_SCROLLBAR_ALLOWANCE * TEXT_SCALE
+    )
+    footer_w = footer.winfo_reqwidth() + 24    # footer has 12px padding on each side
+    header_w = header.winfo_reqwidth()
+    notebook_w = notebook.winfo_reqwidth() + 24    # the row of tab titles must fit as well
+    needed_w = max(tabs_w, footer_w, header_w, notebook_w)
+
+    full_w = min(max(needed_w, PREFERRED_WINDOW_WIDTH), max_w)
+    full_h = min(PREFERRED_WINDOW_HEIGHT, max_h)
+    full_view_size = (full_w, full_h)
+    full_view_min = (min(needed_w, max_w), min(MIN_WINDOW_HEIGHT, max_h))
+
+    # Compact view: just the header and footer, so measure those.
+    compact_w = min(max(footer_w, header_w, 440), max_w)
+    compact_h = min(header.winfo_reqheight() + footer.winfo_reqheight() + 20, max_h)
+    compact_view_size = (compact_w, compact_h)
+
+    # Text size (Update #48): note when the chosen size is too big for this
+    # screen, so fit_text_size_to_screen() can warn and step down. Nothing is
+    # measured at the normal size.
+    if TEXT_SCALE > 1.0:
+        fixed_h = (
+            header.winfo_reqheight()
+            + footer.winfo_reqheight()
+            + int(TEXT_SIZE_TAB_BAR_HEIGHT * TEXT_SCALE)
+        )
+        if needed_w > max_w or fixed_h + TEXT_SIZE_MIN_TAB_AREA > max_h:
+            text_size_fit_report = (needed_w, fixed_h, max_w, max_h)
+    x = max((screen_w - full_w) // 2, 0)
+    y = max((screen_h - full_h) // 2 - 30, 0)
+    window.minsize(*full_view_min)
+    window.geometry(f"{full_w}x{full_h}+{x}+{y}")
+
+
+def fit_text_size_to_screen():
+    """Runs once, just after the window is shown. If the saved text size made
+    the interface too big for this screen, picks the largest smaller size that
+    should fit, saves it for the next launch, and says so. Does nothing when the
+    size fits, which is almost always."""
+    if text_size_fit_report is None:
+        return
+    needed_w, fixed_h, max_w, max_h = text_size_fit_report
+    fallback = TEXT_SIZE_DEFAULT
+    for choice in sorted(TEXT_SIZE_CHOICES, reverse=True):
+        if choice >= startup_text_size:
+            continue
+        ratio = choice / startup_text_size
+        if needed_w * ratio <= max_w and fixed_h * ratio + TEXT_SIZE_MIN_TAB_AREA <= max_h:
+            fallback = choice
+            break
+    text_size_percent_var.set(f"{fallback}%")
+    save_last_settings()
+    messagebox.showinfo(
+        "Text Size Too Large",
+        f"The {startup_text_size}% text size is too big for this screen, so parts of "
+        "Amanuensis may be cut off.\n\n"
+        f"The text size was changed to {fallback}%. Close and reopen Amanuensis to "
+        "use it. You can pick another size on the Window tab.",
+    )
+
+
+def toggle_compact_mode():
+    """Toggle between the full tabbed settings view and a small
+    status-only view (just the header and the Live Statistics +
+    controls footer) -- handy for keeping an eye on progress without
+    the full settings panel taking up screen space."""
+    global compact_mode_active, full_view_size
+    if compact_mode_active:
+        window.minsize(*full_view_min)
+        notebook.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        window.geometry(f"{full_view_size[0]}x{full_view_size[1]}")
+        btn_compact_toggle.configure(text="Compact")
+        compact_mode_active = False
+    else:
+        # Remember the size the user had, so Full View restores it.
+        full_view_size = (window.winfo_width(), window.winfo_height())
+        notebook.pack_forget()
+        window.minsize(*compact_view_size)
+        window.geometry(f"{compact_view_size[0]}x{compact_view_size[1]}")
+        btn_compact_toggle.configure(text="Full View")
+        compact_mode_active = True
+
+
+def on_text_size_chosen(_choice=None):
+    """Runs when a text size is picked in the Text Size card. Saves it right
+    away. Like the theme, the new size shows up the next time Amanuensis
+    launches, since every widget is sized when it is built."""
+    chosen = clamp_text_size_percent(_choice if _choice is not None else text_size_percent_var.get())
+    text_size_percent_var.set(f"{chosen}%")
+    save_last_settings()
+    if chosen == startup_text_size:
+        messagebox.showinfo("Text Size", f"Text size is {chosen}%, the size you are using now.")
+        return
+    messagebox.showinfo(
+        "Text Size Changed",
+        f"Text size set to {chosen}%.\n\nThis will take effect the next time you launch Amanuensis.",
+    )
+
+
+def toggle_theme():
+    """Toggle the theme preference between 'light' and 'dark', immediately
+    persisting it to last_settings.json. Informs the user that the theme
+    change will take effect the next time Amanuensis launches."""
+    current = theme_var.get()
+    new_theme = "dark" if current == "light" else "light"
+    theme_var.set(new_theme)
+    if "btn_theme_toggle" in globals():
+        btn_theme_toggle.configure(text=f"Theme: {new_theme.capitalize()}")
+    save_last_settings()
+    messagebox.showinfo(
+        "Theme Changed",
+        f"Theme set to {new_theme.capitalize()}.\n\nThis will take effect the next time you launch Amanuensis.",
+    )
+
+
+# --------------------------------------------
+# GUI STATS REFRESH LOOP
+# --------------------------------------------
+def update_gui():
+    if state.is_running:
+        if state.total_chars > 0:
+            progress = (state.chars_typed / state.total_chars) * 100
+            progress_var.set(f"{progress:.1f}%")
+            progress_pct_var.set(progress)
+
+        elapsed = time.time() - state.start_time - state.paused_duration
+        elapsed_mins = elapsed / 60
+        if (elapsed_mins > 0 and state.chars_typed > 0
+                and not state.status.startswith("Waiting to start")):
+            words_typed = state.chars_typed / 5
+            state.wpm = int(words_typed / elapsed_mins)
+            wpm_var.set(f"{state.wpm} WPM")
+
+        chars_left = state.total_chars - state.chars_typed
+        if state.wpm > 0:
+            words_left = chars_left / 5
+            mins_left = words_left / state.wpm
+
+            settings = state.settings
+            if settings.get("enable_breaks") and settings.get("break_min") and settings.get("break_max"):
+                avg_break_interval = (settings["break_min"] + settings["break_max"]) / 2
+                remaining_newlines = max(state.total_newlines - state.newlines_typed, 0)
+                estimated_breaks_remaining = remaining_newlines / avg_break_interval if avg_break_interval > 0 else 0
+                avg_break_seconds = (settings["break_duration_min"] + settings["break_duration_max"]) / 2
+                mins_left += (estimated_breaks_remaining * avg_break_seconds) / 60
+
+            # With a target time and long breaks still ahead, the plan knows the
+            # finish time better than the typing pace does (Update #27).
+            if state.target_end_time > 0 and (
+                    state.session_breaks_left > 0 or state.status.startswith("Session break")):
+                mins_left = max(mins_left, (state.target_end_time - time.time()) / 60)
+
+            eta_var.set(f"{int(mins_left)}m {int((mins_left * 60) % 60)}s")
+
+        if state.settings.get("enable_mistakes"):
+            next_mistake_var.set(f"~{state.next_mistake_words} words")
+        else:
+            next_mistake_var.set("Disabled")
+
+        if state.settings.get("enable_breaks"):
+            next_break_var.set(f"~{state.next_break_paragraphs} paragraphs")
+        else:
+            next_break_var.set("Disabled")
+
+    # The Scheduled Start card shows the wait on its own line too (Update #46).
+    if state.is_running and state.status.startswith("Waiting to start"):
+        scheduled_status_var.set(state.status)
+    elif scheduled_status_var.get():
+        scheduled_status_var.set("")
+
+    if state.is_running and state.left_mistakes:
+        status_var.set(f"{state.status}  |  Mistakes left: {len(state.left_mistakes)}")
+    else:
+        status_var.set(state.status)
+    window.after(500, update_gui)
+
+
+# --------------------------------------------
+# GUI SETUP
+# --------------------------------------------
+# Design tokens. This is a diagnostic/control-panel tool, not a
+# marketing surface, so the palette stays restrained: one calm
+# accent (teal) for the primary action, muted amber/brick for the
+# secondary actions, and a cool neutral background. Sections use a
+# small colored marker instead of card shadows/rounded corners
+# (which Tk can't render natively anyway).
+# Startup theme check: read directly from last_settings.json before GUI build.
+# We do not attempt live re-theming of instantiated widgets; theme applies
+# on launch.
+startup_theme = "light"
+try:
+    if os.path.exists(LAST_SETTINGS_PATH):
+        with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as _f:
+            _data = json.load(_f)
+            _theme_val = str(_data.get("theme", "light")).strip().lower()
+            if _theme_val in ("light", "dark"):
+                startup_theme = _theme_val
+except Exception:
+    startup_theme = "light"
+
+# Startup text size check (Update #48): read straight from last_settings.json
+# before any widget is built, just like the theme above. CustomTkinter scales
+# every modern widget and font by this number, so the size applies on launch.
+# TEXT_SCALE is 1.0 at the normal size, and nothing below changes at 1.0.
+startup_text_size = TEXT_SIZE_DEFAULT
+try:
+    if os.path.exists(LAST_SETTINGS_PATH):
+        with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as _f:
+            startup_text_size = clamp_text_size_percent(
+                json.load(_f).get("text_size_percent", TEXT_SIZE_DEFAULT)
+            )
+except Exception:
+    startup_text_size = TEXT_SIZE_DEFAULT
+TEXT_SCALE = startup_text_size / 100.0
+if TEXT_SCALE != 1.0:
+    ctk.set_widget_scaling(TEXT_SCALE)
+
+LIGHT_PALETTE = {
+    "bg": "#eef1f5",
+    "panel_bg": "#ffffff",
+    "input_bg": "#ffffff",
+    "border": "#b8c2cc",
+    "border_strong": "#7d8a99",
+    "text": "#1b2430",
+    "muted": "#647082",
+    "accent": "#1f6f5c",
+    "accent_dark": "#154d40",
+    "amber": "#a8721f",
+    "amber_hover": "#85591a",
+    "disabled_bg": "#d5dbe2",
+    "brick": "#a23b3b",
+    "brick_hover": "#7f2a2a",
+    "header_bg": "#1b2430",
+    "header_hover": "#2c3748",
+    "header_border": "#3a4658",
+    "header_muted": "#9aa7b8",
+    "header_text": "#eef1f5",
+}
+
+DARK_PALETTE = {
+    "bg": "#181b22",
+    "panel_bg": "#222630",
+    "input_bg": "#181b22",
+    "border": "#64748b",
+    "border_strong": "#94a3b8",
+    "text": "#e6edf3",
+    "muted": "#8d98a7",
+    "accent": "#23866b",
+    "accent_dark": "#3ec4a0",
+    "amber": "#b57c24",
+    "amber_hover": "#cf9433",
+    "disabled_bg": "#3a4150",
+    "brick": "#cf5656",
+    "brick_hover": "#e06b6b",
+    "header_bg": "#111318",
+    "header_hover": "#1d222b",
+    "header_border": "#2a3140",
+    "header_muted": "#9aa7b8",
+    "header_text": "#f0f3f6",
+}
+
+PALETTE = DARK_PALETTE if startup_theme == "dark" else LIGHT_PALETTE
+
+
+def scaled_font_size(points):
+    """A plain Tk font size made larger or smaller by the text size setting."""
+    return max(1, int(round(points * TEXT_SCALE)))
+
+
+FONT_BODY = ("Segoe UI", scaled_font_size(9))
+FONT_BODY_BOLD = ("Segoe UI", scaled_font_size(9), "bold")
+FONT_HEADER = ("Segoe UI", scaled_font_size(10), "bold")
+FONT_TITLE = ("Segoe UI", scaled_font_size(14), "bold")
+FONT_SUBTITLE = ("Segoe UI", scaled_font_size(9))
+FONT_STAT = ("Segoe UI", scaled_font_size(12), "bold")
+FONT_STATUS = ("Segoe UI", scaled_font_size(10), "bold")
+
+window = tk.Tk()
+window.title("Amanuensis")
+# Temporary size only; calculate_window_sizes() sets the real one after
+# the interface is built (see WINDOW SIZING above).
+window.geometry(f"{PREFERRED_WINDOW_WIDTH}x{PREFERRED_WINDOW_HEIGHT}")
+window.minsize(*full_view_min)
+window.configure(bg=PALETTE["bg"])
+window.attributes("-topmost", True)
+# Launch speed (v5.11.0): keep the window hidden while the interface is built.
+# A visible window is redrawn after every card that is added, which is slow.
+# It is shown once, finished and sized, by the deiconify() call at the very
+# bottom of this file. Do not remove that call, or the window never appears.
+window.withdraw()
+
+style = ttk.Style(window)
+style.theme_use("clam")
+
+style.configure("TFrame", background=PALETTE["bg"])
+style.configure("Panel.TFrame", background=PALETTE["panel_bg"])
+
+style.configure(
+    "Card.TLabelframe",
+    background=PALETTE["panel_bg"],
+    bordercolor=PALETTE["border"],
+    lightcolor=PALETTE["border"],
+    darkcolor=PALETTE["border"],
+    borderwidth=1,
+    relief="solid",
+)
+style.configure(
+    "Card.TLabelframe.Label",
+    background=PALETTE["bg"],
+    foreground=PALETTE["accent_dark"],
+    font=FONT_HEADER,
+)
+
+style.configure("TLabel", background=PALETTE["panel_bg"], foreground=PALETTE["text"], font=FONT_BODY)
+style.configure("Muted.TLabel", background=PALETTE["panel_bg"], foreground=PALETTE["muted"], font=FONT_BODY)
+style.configure("StatValue.TLabel", background=PALETTE["panel_bg"], foreground=PALETTE["accent_dark"], font=FONT_STAT)
+style.configure("Warning.TLabel", background=PALETTE["panel_bg"], foreground=PALETTE["brick"], font=FONT_BODY)
+
+# Red button used for the Reset This Section buttons on cards that still use ttk.
+style.configure(
+    "Danger.TButton",
+    background=PALETTE["brick"],
+    foreground="#ffffff",
+    bordercolor=PALETTE["brick"],
+    lightcolor=PALETTE["brick"],
+    darkcolor=PALETTE["brick"],
+    font=FONT_BODY_BOLD,
+    padding=(10, 4),
+)
+style.map(
+    "Danger.TButton",
+    background=[("active", PALETTE["brick_hover"])],
+    foreground=[("active", "#ffffff")],
+)
+
+style.configure("TCheckbutton", background=PALETTE["panel_bg"], foreground=PALETTE["text"], font=FONT_BODY)
+style.map("TCheckbutton", background=[("active", PALETTE["panel_bg"])])
+
+style.configure(
+    "TEntry",
+    foreground=PALETTE["text"],
+    fieldbackground=PALETTE["input_bg"],
+    bordercolor=PALETTE["border"],
+    lightcolor=PALETTE["border"],
+    darkcolor=PALETTE["border"],
+    insertcolor=PALETTE["text"],
+    borderwidth=1,
+    relief="solid",
+    padding=6,
+)
+style.map(
+    "TEntry",
+    foreground=[("disabled", PALETTE["muted"])],
+    bordercolor=[("focus", PALETTE["accent"])],
+    lightcolor=[("focus", PALETTE["accent"])],
+    darkcolor=[("focus", PALETTE["accent"])],
+)
+style.configure(
+    "TCombobox",
+    foreground=PALETTE["text"],
+    fieldbackground=PALETTE["input_bg"],
+    background=PALETTE["input_bg"],
+    arrowcolor=PALETTE["text"],
+    bordercolor=PALETTE["border"],
+    lightcolor=PALETTE["border"],
+    darkcolor=PALETTE["border"],
+    borderwidth=1,
+    relief="solid",
+    padding=6,
+)
+style.map(
+    "TCombobox",
+    foreground=[("readonly", PALETTE["text"])],
+    fieldbackground=[("readonly", PALETTE["input_bg"])],
+    background=[("readonly", PALETTE["input_bg"])],
+    bordercolor=[("focus", PALETTE["accent"])],
+    lightcolor=[("focus", PALETTE["accent"])],
+    darkcolor=[("focus", PALETTE["accent"])],
+    arrowcolor=[("disabled", PALETTE["muted"])],
+)
+
+style.configure("TButton", font=FONT_BODY, padding=6)
+
+style.configure("Accent.TButton", background=PALETTE["accent"], foreground="white", font=FONT_STATUS, padding=10)
+style.map("Accent.TButton", background=[("active", PALETTE["accent_dark"]), ("disabled", "#a9c4bd")])
+
+style.configure("Amber.TButton", background=PALETTE["amber"], foreground="white", font=FONT_STATUS, padding=10)
+style.map("Amber.TButton", background=[("active", "#8a5c17"), ("disabled", "#dcc59c")])
+
+style.configure("Brick.TButton", background=PALETTE["brick"], foreground="white", font=FONT_STATUS, padding=10)
+style.map("Brick.TButton", background=[("active", "#7e2e2e"), ("disabled", "#e0b8b8")])
+
+style.configure(
+    "TNotebook",
+    background=PALETTE["bg"],
+    borderwidth=0,
+)
+style.configure(
+    "TNotebook.Tab",
+    background=PALETTE["bg"],
+    foreground=PALETTE["muted"],
+    font=FONT_BODY_BOLD,
+    padding=(16, 8),
+    borderwidth=0,
+)
+style.map(
+    "TNotebook.Tab",
+    background=[("selected", PALETTE["panel_bg"])],
+    foreground=[("selected", PALETTE["accent_dark"])],
+)
+
+style.configure(
+    "Accent.Horizontal.TProgressbar",
+    troughcolor=PALETTE["border"],
+    background=PALETTE["accent"],
+    bordercolor=PALETTE["border"],
+    lightcolor=PALETTE["accent"],
+    darkcolor=PALETTE["accent"],
+)
+
+style.configure(
+    "Treeview",
+    background=PALETTE["input_bg"],
+    foreground=PALETTE["text"],
+    fieldbackground=PALETTE["input_bg"],
+    borderwidth=0,
+    rowheight=int(round(26 * TEXT_SCALE)),
+    font=FONT_BODY,
+)
+style.configure(
+    "Treeview.Heading",
+    background=PALETTE["bg"],
+    foreground=PALETTE["text"],
+    relief="flat",
+    borderwidth=0,
+    font=FONT_BODY,
+)
+
+
+# Variables
+theme_var = tk.StringVar(value=startup_theme)
+text_size_percent_var = tk.StringVar(value=f"{startup_text_size}%")
+input_path_var = tk.StringVar(value="input.txt")
+file_queue_var = tk.Variable(value=[])
+
+window_var = tk.StringVar(value="")
+lock_window_var = tk.BooleanVar(value=False)
+enable_auto_profile_var = tk.BooleanVar(value=False)
+auto_profile_rules_var = tk.StringVar(value="[]")  # the rules, saved as JSON text
+auto_profile_keyword_var = tk.StringVar(value="")  # new-rule boxes (not saved)
+auto_profile_choice_var = tk.StringVar(value="")
+auto_profile_status_var = tk.StringVar(value="")
+# Starter profiles (Update #47): a screen choice only, never saved.
+starter_profile_choice_var = tk.StringVar(value=get_starter_profile_names()[0])
+starter_profile_description_var = tk.StringVar(value="")
+starter_profile_choice_var.trace_add("write", refresh_starter_profile_description)
+refresh_starter_profile_description()
+auto_pause_activity_var = tk.BooleanVar(value=False)
+activity_sensitivity_var = tk.StringVar(value="20")
+
+min_delay_var = tk.StringVar(value="0.05")
+max_delay_var = tk.StringVar(value="0.15")
+target_wpm_var = tk.StringVar(value="")
+enable_fatigue_var = tk.BooleanVar(value=False)
+fatigue_strength_var = tk.StringVar(value="15")
+enable_finger_timing_var = tk.BooleanVar(value=True)
+enable_typing_moods_var = tk.BooleanVar(value=True)
+typing_mood_strength_var = tk.StringVar(value="100")
+enable_difficulty_pauses_var = tk.BooleanVar(value=True)
+difficulty_pause_strength_var = tk.StringVar(value="100")
+enable_typing_bursts_var = tk.BooleanVar(value=True)
+burst_pause_strength_var = tk.StringVar(value="100")
+enable_decision_pauses_var = tk.BooleanVar(value=True)
+decision_pause_strength_var = tk.StringVar(value="100")
+enable_uneven_rhythm_var = tk.BooleanVar(value=True)
+rhythm_strength_var = tk.StringVar(value="100")
+enable_writing_habits_var = tk.BooleanVar(value=True)
+writing_habit_strength_var = tk.StringVar(value="100")
+enable_essay_pace_var = tk.BooleanVar(value=True)
+essay_pace_strength_var = tk.StringVar(value="100")
+enable_warmup_var = tk.BooleanVar(value=True)
+warmup_strength_var = tk.StringVar(value="100")
+start_countdown_seconds_var = tk.StringVar(value=str(START_COUNTDOWN_DEFAULT))
+enable_scheduled_start_var = tk.BooleanVar(value=False)
+scheduled_start_time_var = tk.StringVar(value=SCHEDULED_START_DEFAULT)
+scheduled_status_var = tk.StringVar(value="")
+
+enable_target_time_var = tk.BooleanVar(value=False)
+target_hours_var = tk.StringVar(value="2")
+target_minutes_var = tk.StringVar(value="0")
+
+paragraph_pause_min_var = tk.StringVar(value="10")
+paragraph_pause_max_var = tk.StringVar(value="20")
+sentence_pause_min_var = tk.StringVar(value="5")
+sentence_pause_max_var = tk.StringVar(value="7")
+enable_pause_markers_var = tk.BooleanVar(value=True)
+enable_format_markers_var = tk.BooleanVar(value=True)
+
+enable_mistakes_var = tk.BooleanVar(value=True)
+mistake_min_var = tk.StringVar(value="100")
+mistake_max_var = tk.StringVar(value="200")
+
+enable_breaks_var = tk.BooleanVar(value=True)
+break_min_var = tk.StringVar(value="3")
+break_max_var = tk.StringVar(value="6")
+break_duration_min_var = tk.StringVar(value="60")
+break_duration_max_var = tk.StringVar(value="180")
+
+enable_typos_var = tk.BooleanVar(value=True)
+typo_chance_var = tk.StringVar(value="4")
+use_extra_typos_var = tk.BooleanVar(value=False)
+enable_capital_slips_var = tk.BooleanVar(value=True)
+
+enable_paraphrase_var = tk.BooleanVar(value=True)
+paraphrase_chance_var = tk.StringVar(value="15")
+
+enable_lookback_edit_var = tk.BooleanVar(value=False)
+lookback_edit_chance_var = tk.StringVar(value="25")
+
+enable_select_retype_var = tk.BooleanVar(value=False)
+select_retype_chance_var = tk.StringVar(value="20")
+enable_overshoot_var = tk.BooleanVar(value=True)
+overshoot_chance_var = tk.StringVar(value="30")
+enable_key_hold_var = tk.BooleanVar(value=False)
+key_hold_min_ms_var = tk.StringVar(value="40")
+key_hold_max_ms_var = tk.StringVar(value="110")
+enable_shift_hold_var = tk.BooleanVar(value=True)
+enable_key_overlap_var = tk.BooleanVar(value=False)
+key_overlap_chance_var = tk.StringVar(value="30")
+enable_revision_clusters_var = tk.BooleanVar(value=True)
+cluster_strength_var = tk.StringVar(value="100")
+revision_style_var = tk.StringVar(value=CLUSTER_STYLE_MIXED)
+editor_mode_var = tk.StringVar(value=EDITOR_MODE_PLAIN)
+
+enable_smart_fixes_var = tk.BooleanVar(value=False)
+smart_fix_spacing_var = tk.BooleanVar(value=True)
+smart_fix_punctuation_var = tk.BooleanVar(value=True)
+smart_fix_capitalization_var = tk.BooleanVar(value=True)
+smart_fix_repeated_words_var = tk.BooleanVar(value=True)
+smart_fix_visible_chance_var = tk.StringVar(value="50")
+
+enable_leave_mistakes_var = tk.BooleanVar(value=False)
+leave_mistake_count_var = tk.StringVar(value="3")
+leave_mistakes_typos_var = tk.BooleanVar(value=True)
+leave_mistakes_commas_var = tk.BooleanVar(value=True)
+leave_mistakes_punctuation_var = tk.BooleanVar(value=True)
+
+hotkey_start_var = tk.StringVar(value="f8")
+hotkey_pause_var = tk.StringVar(value="f9")
+hotkey_stop_var = tk.StringVar(value="esc")
+hotkey_skip_break_var = tk.StringVar(value="ctrl+alt+b")
+hotkey_warning_var = tk.StringVar(value="")
+
+log_enabled_var = tk.BooleanVar(value=False)
+enable_notify_var = tk.BooleanVar(value=True)
+enable_sound_var = tk.BooleanVar(value=True)
+alert_on_auto_pause_var = tk.BooleanVar(value=False)
+check_typed_text_var = tk.BooleanVar(value=False)
+preview_speed_var = tk.StringVar(value=preview_speed_label(PREVIEW_SPEED_DEFAULT))
+enable_update_check_var = tk.BooleanVar(value=True)
+skipped_update_version_var = tk.StringVar(value="")
+update_status_var = tk.StringVar(value="Not checked yet this session.")
+
+wpm_var = tk.StringVar(value="0 WPM")
+eta_var = tk.StringVar(value="0m 0s")
+progress_var = tk.StringVar(value="0.0%")
+progress_pct_var = tk.DoubleVar(value=0.0)
+status_var = tk.StringVar(value="Idle")
+next_mistake_var = tk.StringVar(value="~100 words")
+next_break_var = tk.StringVar(value="~3 paragraphs")
+preview_result_var = tk.StringVar(value="")
+resume_status_var = tk.StringVar(value="")
+
+# --------------------------------------------
+# RESET-TO-DEFAULT SECTIONS (Idea #19)
+# --------------------------------------------
+# Which variables belong to which settings card. The default for each
+# variable is read right here, straight after the declarations above
+# and BEFORE load_last_settings() runs, so the declarations stay the
+# single source of truth for default values. When you add a new
+# setting, add its variable to the matching card's list below.
+SECTION_RESET_VARS = {
+    "Auto Profile": [enable_auto_profile_var, auto_profile_rules_var],
+    "Editor Type": [editor_mode_var],
+    "Start Countdown": [start_countdown_seconds_var],
+    "Scheduled Start": [enable_scheduled_start_var, scheduled_start_time_var],
+    "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
+    "Typing Speed": [min_delay_var, max_delay_var, target_wpm_var],
+    "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
+    "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
+    "Finger & Hand Timing": [enable_finger_timing_var],
+    "Key Press Timing": [
+        enable_key_hold_var,
+        key_hold_min_ms_var,
+        key_hold_max_ms_var,
+        enable_shift_hold_var,
+        enable_key_overlap_var,
+        key_overlap_chance_var,
+    ],
+    "Flow & Hesitation": [enable_typing_moods_var, typing_mood_strength_var],
+    "Uneven Rhythm": [enable_uneven_rhythm_var, rhythm_strength_var],
+    "Natural Pauses": [
+        paragraph_pause_min_var,
+        paragraph_pause_max_var,
+        sentence_pause_min_var,
+        sentence_pause_max_var,
+        enable_pause_markers_var,
+    ],
+    "Difficulty Pauses": [enable_difficulty_pauses_var, difficulty_pause_strength_var],
+    "Typing Bursts": [enable_typing_bursts_var, burst_pause_strength_var],
+    "Decision Pauses": [enable_decision_pauses_var, decision_pause_strength_var],
+    "Writing Habits": [enable_writing_habits_var, writing_habit_strength_var],
+    "Essay Pace": [enable_essay_pace_var, essay_pace_strength_var],
+    "Warm-Up After Breaks": [enable_warmup_var, warmup_strength_var],
+    "Formatting Markers": [enable_format_markers_var],
+    "Character Typos": [
+        enable_typos_var,
+        typo_chance_var,
+        use_extra_typos_var,
+        enable_capital_slips_var,
+    ],
+    "Sentence Reworks & Breaks": [
+        enable_mistakes_var,
+        mistake_min_var,
+        mistake_max_var,
+        enable_breaks_var,
+        break_min_var,
+        break_max_var,
+        break_duration_min_var,
+        break_duration_max_var,
+        enable_paraphrase_var,
+        paraphrase_chance_var,
+    ],
+    "Second Revision Pass": [enable_lookback_edit_var, lookback_edit_chance_var],
+    "Select, Retype & Overshoot": [
+        enable_select_retype_var,
+        select_retype_chance_var,
+        enable_overshoot_var,
+        overshoot_chance_var,
+    ],
+    "Revision Clusters": [enable_revision_clusters_var, cluster_strength_var, revision_style_var],
+    "Smart Text Fixes": [
+        enable_smart_fixes_var,
+        smart_fix_spacing_var,
+        smart_fix_punctuation_var,
+        smart_fix_capitalization_var,
+        smart_fix_repeated_words_var,
+        smart_fix_visible_chance_var,
+    ],
+    "Leave Mistakes For Me": [
+        enable_leave_mistakes_var,
+        leave_mistake_count_var,
+        leave_mistakes_typos_var,
+        leave_mistakes_commas_var,
+        leave_mistakes_punctuation_var,
+    ],
+    "Hotkeys": [hotkey_start_var, hotkey_pause_var, hotkey_stop_var, hotkey_skip_break_var],
+    "Session Log": [log_enabled_var],
+    "Alerts": [enable_notify_var, enable_sound_var, alert_on_auto_pause_var],
+    "Check Typed Text": [check_typed_text_var],
+    "Updates": [enable_update_check_var, skipped_update_version_var],
+}
+
+SECTION_DEFAULTS = {
+    section_name: [(var, var.get()) for var in section_vars]
+    for section_name, section_vars in SECTION_RESET_VARS.items()
+}
+
+# --------------------------------------------
+# MODERN (CustomTkinter) WIDGET HELPERS
+# --------------------------------------------
+# Every part of the interface is built with these helpers, so the whole app
+# shares one rounded look. Colors come only from PALETTE, so the light/dark
+# theme chosen at startup still applies.
+BORDER_WIDTH = 4       # outline thickness of entry boxes, text boxes, dropdowns
+CHECKBOX_BORDER = 3    # outline thickness of checkboxes
+CORNER_RADIUS = 10     # roundness of buttons, entries, and other controls
+
+
+def modern_font(bold=False, size=13):
+    """Font used by the CustomTkinter widgets."""
+    return ctk.CTkFont(family="Segoe UI", size=size, weight="bold" if bold else "normal")
+
+
+class ModernButton(ctk.CTkButton):
+    """A CTkButton that also turns grey when it is disabled, so a disabled
+    Pause or Stop button never looks clickable."""
+
+    def __init__(self, master, **kwargs):
+        self._enabled_fg = kwargs.get("fg_color")
+        starts_disabled = kwargs.get("state") == "disabled"
+        super().__init__(master, **kwargs)
+        if starts_disabled:
+            self._show_disabled_look(True)
+
+    def _show_disabled_look(self, disabled):
+        if self._enabled_fg in (None, "transparent"):
+            return  # outline-only buttons just dim their text
+        super().configure(fg_color=PALETTE["disabled_bg"] if disabled else self._enabled_fg)
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "state" in kwargs:
+            self._show_disabled_look(kwargs["state"] == "disabled")
+        super().configure(require_redraw=require_redraw, **kwargs)
+
+
+BUTTON_LOOKS = {
+    # kind: (normal color key, hover color key) in PALETTE
+    "primary": ("accent", "accent_dark"),
+    "danger": ("brick", "brick_hover"),
+    "amber": ("amber", "amber_hover"),
+}
+
+
+def modern_button(parent, text, command, kind="primary", state="normal"):
+    """A rounded button. kind is 'primary' (green), 'danger' (red, used for
+    every Reset button), 'amber', or 'neutral' (white with an outline)."""
+    common = dict(
+        text=text,
+        command=command,
+        state=state,
+        height=34,
+        corner_radius=CORNER_RADIUS,
+        text_color_disabled=PALETTE["muted"],
+        font=modern_font(bold=True),
+    )
+    if kind == "neutral":
+        return ModernButton(
+            parent,
+            fg_color=PALETTE["panel_bg"],
+            hover_color=PALETTE["bg"],
+            border_width=2,
+            border_color=PALETTE["border_strong"],
+            text_color=PALETTE["text"],
+            **common,
+        )
+    fg_key, hover_key = BUTTON_LOOKS[kind]
+    return ModernButton(
+        parent,
+        fg_color=PALETTE[fg_key],
+        hover_color=PALETTE[hover_key],
+        text_color="#ffffff",
+        **common,
+    )
+
+
+def modern_label(parent, text="", kind="normal", textvariable=None, wraplength=0):
+    """A label. kind is 'normal', 'muted', 'warning', 'stat' (big green
+    number), or 'status' (bold)."""
+    colors = {
+        "normal": PALETTE["text"],
+        "muted": PALETTE["muted"],
+        "warning": PALETTE["brick"],
+        "stat": PALETTE["accent_dark"],
+        "status": PALETTE["text"],
+    }
+    options = {
+        "font": modern_font(bold=True, size=16) if kind == "stat" else modern_font(bold=(kind == "status")),
+        "text_color": colors[kind],
+        "anchor": "w",
+        "justify": "left",
+        "wraplength": wraplength,
+    }
+    if textvariable is not None:
+        options["textvariable"] = textvariable
+    else:
+        options["text"] = text
+    return ctk.CTkLabel(parent, **options)
+
+
+def modern_frame(parent, bordered=False):
+    """A plain see-through container, or (bordered=True) a rounded outlined
+    box used to frame lists and tables."""
+    if bordered:
+        return ctk.CTkFrame(
+            parent,
+            corner_radius=CORNER_RADIUS,
+            border_width=BORDER_WIDTH,
+            fg_color=PALETTE["input_bg"],
+            border_color=PALETTE["border_strong"],
+        )
+    return ctk.CTkFrame(parent, fg_color="transparent")
+
+
+def make_modern_card(parent, title):
+    """A rounded card with a title. Returns the body frame, which is where
+    the card's widgets are placed with grid()."""
+    outer = ctk.CTkFrame(
+        parent,
+        corner_radius=16,
+        border_width=1,
+        fg_color=PALETTE["panel_bg"],
+        border_color=PALETTE["border"],
+        bg_color=PALETTE["bg"],
+    )
+    outer.pack(fill="x", pady=(0, 10))
+    outer.columnconfigure(0, weight=1)
+    ctk.CTkLabel(
+        outer,
+        text="\u25a0 " + title,
+        font=modern_font(bold=True),
+        text_color=PALETTE["accent_dark"],
+        anchor="w",
+    ).grid(row=0, column=0, sticky="w", padx=18, pady=(14, 4))
+    body = ctk.CTkFrame(outer, fg_color="transparent")
+    body.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 16))
+    return body
+
+
+def modern_entry(parent, var, width=10):
+    """A short entry box. width is in characters (about 11 pixels each).
+    The border turns accent-colored while the box has focus."""
+    entry = ctk.CTkEntry(
+        parent,
+        textvariable=var,
+        width=width * 11,
+        height=40,
+        corner_radius=CORNER_RADIUS,
+        border_width=BORDER_WIDTH,
+        fg_color=PALETTE["input_bg"],
+        border_color=PALETTE["border_strong"],
+        text_color=PALETTE["text"],
+        font=modern_font(),
+    )
+    entry.bind("<FocusIn>", lambda _event: entry.configure(border_color=PALETTE["accent"]))
+    entry.bind("<FocusOut>", lambda _event: entry.configure(border_color=PALETTE["border_strong"]))
+    return entry
+
+
+def modern_checkbox(parent, text, variable):
+    """A checkbox tied to a tk.BooleanVar."""
+    return ctk.CTkCheckBox(
+        parent,
+        text=text,
+        variable=variable,
+        onvalue=True,
+        offvalue=False,
+        corner_radius=6,
+        border_width=CHECKBOX_BORDER,
+        fg_color=PALETTE["accent"],
+        hover_color=PALETTE["accent_dark"],
+        border_color=PALETTE["border_strong"],
+        text_color=PALETTE["text"],
+        checkmark_color="#ffffff",
+        font=modern_font(),
+    )
+
+
+def modern_separator(parent):
+    """A thin rounded divider line. Place it with grid(sticky="we")."""
+    return ctk.CTkFrame(parent, height=3, corner_radius=2, fg_color=PALETTE["border"])
+
+
+def modern_scrollbar(parent, command, horizontal=False):
+    """A rounded scrollbar. Its .set method plugs into yscrollcommand /
+    xscrollcommand just like a normal scrollbar."""
+    return ctk.CTkScrollbar(
+        parent,
+        orientation="horizontal" if horizontal else "vertical",
+        command=command,
+        width=40 if horizontal else 14,   # the long side is stretched by grid/pack
+        height=14 if horizontal else 40,
+        fg_color="transparent",
+        button_color=PALETTE["border_strong"],
+        button_hover_color=PALETTE["accent"],
+    )
+
+
+def modern_textbox(parent, height=120):
+    """A multi-line text box with a rounded outline and its own scrollbar."""
+    box = ctk.CTkTextbox(
+        parent,
+        height=height,
+        wrap="word",
+        font=modern_font(),
+        fg_color=PALETTE["input_bg"],
+        text_color=PALETTE["text"],
+        corner_radius=CORNER_RADIUS,
+        border_width=BORDER_WIDTH,
+        border_color=PALETTE["border_strong"],
+        scrollbar_button_color=PALETTE["border_strong"],
+        scrollbar_button_hover_color=PALETTE["accent"],
+    )
+    box.bind("<FocusIn>", lambda _event: box.configure(border_color=PALETTE["accent"]))
+    box.bind("<FocusOut>", lambda _event: box.configure(border_color=PALETTE["border_strong"]))
+    return box
+
+
+def modern_combobox(parent, var, width=30):
+    """A read-only dropdown. Fill it with combo.configure(values=[...])."""
+    return ctk.CTkComboBox(
+        parent,
+        variable=var,
+        values=[""],
+        state="readonly",
+        width=width * 9,
+        height=40,
+        corner_radius=CORNER_RADIUS,
+        border_width=BORDER_WIDTH,
+        fg_color=PALETTE["input_bg"],
+        border_color=PALETTE["border_strong"],
+        button_color=PALETTE["accent"],
+        button_hover_color=PALETTE["accent_dark"],
+        text_color=PALETTE["text"],
+        dropdown_fg_color=PALETTE["panel_bg"],
+        dropdown_text_color=PALETTE["text"],
+        dropdown_hover_color=PALETTE["bg"],
+        font=modern_font(),
+        dropdown_font=modern_font(),
+    )
+
+
+def modern_progressbar(parent, percent_var):
+    """A rounded progress bar that follows a 0-100 tk.DoubleVar."""
+    bar = ctk.CTkProgressBar(
+        parent,
+        height=14,
+        corner_radius=7,
+        fg_color=PALETTE["border"],
+        progress_color=PALETTE["accent"],
+    )
+
+    def _sync(*_args):
+        try:
+            fraction = float(percent_var.get()) / 100.0
+        except (tk.TclError, ValueError):
+            fraction = 0.0
+        bar.set(min(max(fraction, 0.0), 1.0))
+
+    percent_var.trace_add("write", _sync)
+    _sync()
+    return bar
+
+
+def scale_popup_size(width, height):
+    """Makes a pop-up window size bigger to match the text size, never bigger
+    than the screen (Update #48). Unchanged at the normal text size."""
+    if TEXT_SCALE <= 1.0:
+        return width, height
+    max_w = max(window.winfo_screenwidth() - SCREEN_MARGIN_WIDTH, 300)
+    max_h = max(window.winfo_screenheight() - SCREEN_MARGIN_HEIGHT, 300)
+    return min(int(width * TEXT_SCALE), max_w), min(int(height * TEXT_SCALE), max_h)
+
+
+def modern_toplevel(parent, title, size, min_size):
+    """A rounded-look pop-up window (Preview Run, Session Log Viewer)."""
+    try:
+        width, height = (int(part) for part in size.split("x"))
+        size = "{}x{}".format(*scale_popup_size(width, height))
+    except ValueError:
+        pass  # an unusual size text is used as it is
+    min_size = scale_popup_size(*min_size)
+    top = ctk.CTkToplevel(parent, fg_color=PALETTE["bg"])
+    top.title(title)
+    top.geometry(size)
+    top.minsize(*min_size)
+    top.transient(parent)
+    return top
+
+
+def make_tab_area(parent, titles):
+    """A pill-shaped tab bar plus one page per title. Returns
+    (container, pages, selector): pack the container like any frame, put each
+    tab's content in pages[title], and selector is the tab bar itself."""
+    container = ctk.CTkFrame(parent, fg_color="transparent")
+    selector_holder = ctk.CTkFrame(container, fg_color="transparent")
+    body = ctk.CTkFrame(container, fg_color="transparent")
+    pages = {title: ctk.CTkFrame(body, fg_color="transparent") for title in titles}
+
+    def show_tab(title):
+        for page in pages.values():
+            page.pack_forget()
+        pages[title].pack(fill="both", expand=True)
+
+    selector = ctk.CTkSegmentedButton(
+        selector_holder,
+        values=list(titles),
+        command=show_tab,
+        height=38,
+        corner_radius=CORNER_RADIUS + 2,
+        fg_color=PALETTE["header_bg"],
+        unselected_color=PALETTE["header_bg"],
+        unselected_hover_color=PALETTE["header_hover"],
+        selected_color=PALETTE["accent"],
+        selected_hover_color=PALETTE["accent_dark"],
+        text_color=PALETTE["header_text"],
+        font=modern_font(bold=True),
+    )
+    selector.pack(fill="x", padx=4)
+    selector_holder.pack(fill="x", pady=(0, 8))
+    body.pack(fill="both", expand=True)
+    selector.set(titles[0])
+    show_tab(titles[0])
+    return container, pages, selector
+
+
+# --- Rounded pop-up dialogs (replace the plain Windows message boxes) ---
+def show_modern_dialog(title, message, buttons, kind="info", parent=None, cancel_value=False):
+    """Show a modal rounded dialog and return the value of the clicked button.
+    buttons is a list of (label, value, button_kind); the first is the default
+    (Enter key). Closing the dialog or pressing Escape returns cancel_value."""
+    owner = parent if parent is not None else window
+    dialog = ctk.CTkToplevel(owner, fg_color=PALETTE["bg"])
+    dialog.title(title)
+    dialog.resizable(False, False)
+    dialog.transient(owner)
+    dialog.attributes("-topmost", True)
+    result = {"value": cancel_value}
+
+    def choose(value):
+        result["value"] = value
+        dialog.destroy()
+
+    card = ctk.CTkFrame(
+        dialog,
+        corner_radius=16,
+        border_width=1,
+        fg_color=PALETTE["panel_bg"],
+        border_color=PALETTE["border"],
+        bg_color=PALETTE["bg"],
+    )
+    card.pack(fill="both", expand=True, padx=14, pady=14)
+
+    icon_colors = {"info": PALETTE["accent"], "error": PALETTE["brick"], "question": PALETTE["amber"]}
+    icon_symbols = {"info": "i", "error": "!", "question": "?"}
+    icon = ctk.CTkFrame(card, width=44, height=44, corner_radius=22, fg_color=icon_colors[kind])
+    icon.pack_propagate(False)
+    icon.grid(row=0, column=0, rowspan=2, padx=(18, 12), pady=(18, 8), sticky="n")
+    ctk.CTkLabel(
+        icon,
+        text=icon_symbols[kind],
+        fg_color="transparent",
+        text_color="#ffffff",
+        font=modern_font(bold=True, size=20),
+    ).place(relx=0.5, rely=0.5, anchor="center")
+    modern_label(card, title, kind="stat").grid(row=0, column=1, padx=(0, 18), pady=(18, 2), sticky="w")
+    modern_label(card, message, wraplength=380).grid(row=1, column=1, padx=(0, 18), pady=(0, 8), sticky="w")
+
+    button_row = modern_frame(card)
+    button_row.grid(row=2, column=0, columnspan=2, sticky="e", padx=18, pady=(8, 16))
+    for label, value, button_kind in buttons:
+        modern_button(button_row, label, lambda v=value: choose(v), kind=button_kind).pack(side="left", padx=(8, 0))
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(cancel_value))
+    dialog.bind("<Escape>", lambda _event: choose(cancel_value))
+    dialog.bind("<Return>", lambda _event: choose(buttons[0][1]))
+
+    # Centre the dialog over the window that opened it.
+    dialog.update_idletasks()
+    width, height = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+    x = owner.winfo_rootx() + (owner.winfo_width() - width) // 2
+    y = owner.winfo_rooty() + (owner.winfo_height() - height) // 3
+    dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+
+    dialog.wait_visibility()
+    dialog.grab_set()
+    dialog.focus_force()
+    dialog.wait_window()
+    return result["value"]
+
+
+class ModernMessageBox:
+    """Same four calls as tkinter.messagebox (showinfo, showerror, askyesno,
+    askokcancel), so every existing call in the app shows a rounded dialog."""
+
+    def showinfo(self, title, message, parent=None, **_options):
+        show_modern_dialog(title, message, [("OK", True, "primary")], kind="info", parent=parent)
+        return "ok"
+
+    def showerror(self, title, message, parent=None, **_options):
+        show_modern_dialog(title, message, [("OK", True, "danger")], kind="error", parent=parent)
+        return "ok"
+
+    def askyesno(self, title, message, parent=None, **_options):
+        return show_modern_dialog(
+            title, message, [("Yes", True, "primary"), ("No", False, "neutral")], kind="question", parent=parent
+        )
+
+    def askokcancel(self, title, message, parent=None, **_options):
+        return show_modern_dialog(
+            title, message, [("OK", True, "primary"), ("Cancel", False, "neutral")], kind="question", parent=parent
+        )
+
+
+messagebox = ModernMessageBox()
+
+
+# --------------------------------------------
+# HEADER BANNER
+# --------------------------------------------
+header = ctk.CTkFrame(window, fg_color=PALETTE["header_bg"], corner_radius=0)
+header.pack(fill="x", side="top")
+
+header_text_frame = ctk.CTkFrame(header, fg_color="transparent")
+header_text_frame.pack(side="left", fill="both", expand=True)
+ctk.CTkLabel(
+    header_text_frame,
+    text="Amanuensis",
+    text_color=PALETTE["header_text"],
+    font=modern_font(bold=True, size=22),
+    anchor="w",
+).pack(anchor="w", padx=16, pady=(12, 0))
+ctk.CTkLabel(
+    header_text_frame,
+    text="Your human-like typing assistant",
+    text_color=PALETTE["header_muted"],
+    font=modern_font(),
+    anchor="w",
+).pack(anchor="w", padx=16, pady=(0, 12))
+
+
+def make_header_button(text, command):
+    """A small outlined button for the dark header banner."""
+    return ctk.CTkButton(
+        header,
+        text=text,
+        command=command,
+        width=112,
+        height=32,
+        corner_radius=CORNER_RADIUS,
+        fg_color="transparent",
+        hover_color=PALETTE["header_hover"],
+        border_width=2,
+        border_color=PALETTE["header_border"],
+        text_color=PALETTE["header_muted"],
+        font=modern_font(),
+    )
+
+
+btn_compact_toggle = make_header_button("Compact", toggle_compact_mode)
+btn_compact_toggle.pack(side="right", padx=(4, 16), pady=12)
+
+btn_theme_toggle = make_header_button(f"Theme: {theme_var.get().capitalize()}", toggle_theme)
+btn_theme_toggle.pack(side="right", padx=(0, 4), pady=12)
+
+# --------------------------------------------
+# PERSISTENT FOOTER (Live Statistics + Controls)
+# Packed *before* the notebook, with side="bottom", so it always
+# keeps its space and is never the part that gets clipped -- this
+# fixes the cutoff issue from the previous layout directly.
+# --------------------------------------------
+footer = ctk.CTkFrame(window, fg_color="transparent")
+footer.pack(fill="x", side="bottom", padx=12, pady=(6, 12))
+
+frame_stats = make_modern_card(footer, "Live Statistics")
+
+progress_bar = modern_progressbar(frame_stats, progress_pct_var)
+progress_bar.grid(row=0, column=0, columnspan=4, sticky="we", pady=(0, 10))
+frame_stats.columnconfigure(0, weight=1)
+frame_stats.columnconfigure(1, weight=1)
+frame_stats.columnconfigure(2, weight=1)
+frame_stats.columnconfigure(3, weight=1)
+
+def _stat_cell(parent, row, col, label_text, value_var):
+    modern_label(parent, label_text, kind="muted").grid(row=row, column=col, sticky="w", padx=(0, 4))
+    modern_label(parent, textvariable=value_var, kind="stat").grid(
+        row=row + 1, column=col, sticky="w", padx=(0, 4), pady=(0, 6)
+    )
+
+_stat_cell(frame_stats, 1, 0, "Speed", wpm_var)
+_stat_cell(frame_stats, 1, 1, "ETA", eta_var)
+_stat_cell(frame_stats, 1, 2, "Progress", progress_var)
+_stat_cell(frame_stats, 3, 0, "Next Mistake", next_mistake_var)
+_stat_cell(frame_stats, 3, 1, "Next Break", next_break_var)
+
+status_row = modern_frame(frame_stats)
+status_row.grid(row=3, column=2, columnspan=2, sticky="e", pady=(0, 6))
+ctk.CTkLabel(status_row, text="\u25cf", text_color=PALETTE["accent"], font=modern_font(size=16)).pack(side="left")
+modern_label(status_row, textvariable=status_var, kind="status").pack(side="left", padx=(4, 0))
+
+controls_row = modern_frame(footer)
+controls_row.pack(fill="x")
+
+btn_start = modern_button(controls_row, "Start Typing", start_typing, kind="primary")
+btn_start.pack(side="left", expand=True, padx=(0, 4), fill="x")
+
+btn_preview = modern_button(controls_row, "Preview Run", open_preview_window, kind="neutral")
+btn_preview.pack(side="left", expand=True, padx=4, fill="x")
+
+btn_pause = modern_button(controls_row, "Pause Typing", toggle_pause, kind="amber", state=tk.DISABLED)
+btn_pause.pack(side="left", expand=True, padx=4, fill="x")
+
+btn_stop = modern_button(controls_row, "Stop Typing", stop_typing, kind="danger", state=tk.DISABLED)
+btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
+
+# Skip Break (Update #50): only turns on while a research break is counting down.
+btn_skip_break = modern_button(controls_row, "Skip Break", skip_research_break, kind="neutral", state=tk.DISABLED)
+btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
+
+# --------------------------------------------
+# VERSION HISTORY DATA (Idea #23)
+# --------------------------------------------
+# Every release, newest first. The History tab is built from this list.
+# It lives in the code (not in a separate file) so it still works when the
+# app is packaged into a single .exe. The comment block at the very top of
+# this file only keeps the 3 newest entries; this list keeps them all.
+# Each entry: version, date (None if it was never written down), a short
+# title, and a list of plain-English change lines.
+VERSION_HISTORY = [
+    {
+        "version": "5.32.0",
+        "date": "2026-11-09",
+        "title": "Real key press timing",
+        "changes": [
+            "Added: a Key Press Timing card on the Speed tab. When it is on, every letter and the space bar is pressed down, held for a short random time (40 to 110 milliseconds by default), and then released, instead of being pressed and released in one instant. This helps testers whose pages react to the key being released, and it looks more like a real hand. It is off by default.",
+            "Added: Shift is held for capital letters. Shift goes down just before the letter and comes up just after it. It has its own checkbox.",
+            "Added: optional overlap, off by default. When two quick letters are typed by opposite hands, the next key can go down just before the last one comes up. A chance box sets how often.",
+            "Added: six new settings, saved with your profiles and restored on launch. The card has its own Reset This Section button.",
+            "Modified: the time a key is held counts as part of the gap before the next key, so your typing speed and the time estimate stay the same.",
+            "Notes: only plain letters and the space bar use this. Numbers, punctuation, and other characters are still typed in one instant, because pressing them by key name can type the wrong character on some keyboard layouts. Every held key is let go when you press Stop and when a run ends, and a short safety timer lets go of a key an overlap left down, so a key can never get stuck. Backspace and shortcuts are still instant, and the Preview Run presses no keys. Older settings and profile files load with Key Press Timing off. No new packages.",
+        ],
+    },
+    {
+        "version": "5.31.0",
+        "date": "2026-10-30",
+        "title": "Editor type",
+        "changes": [
+            "Added: an Editor Type card on the Window tab with one new setting (Plain text, Google Docs or Word, or Code editor), saved with your profiles and restored on launch. Plain text is the default and types exactly as before. The card has its own Reset This Section button.",
+            "Added: Google Docs or Word mode. Google Docs and Word turn a line that starts with 1. or - into a real list as soon as you type the space. In this mode, Amanuensis types the space first, steps back, types the marker, and steps forward again, so the editor does not make a list and the text matches your file.",
+            "Added: Code editor mode. Code editors add their own indent after Enter, so the spaces in your file were added on top of it. In this mode, Amanuensis clears that indent at the start of each line before typing the line's own spaces.",
+            "Modified: starter profiles do not change your editor type, and the Auto Profile feature can pick it, because a saved profile carries it.",
+            "Notes: neither mode ever deletes real text, and Preview skips the extra keys. A list marker is typed the normal way when a bold or italic shortcut, a pause marker, or a left-on-purpose mistake falls inside it. Amanuensis cannot undo auto-closing brackets, suggestion pop-ups, or other autocorrect such as smart quotes, so turn those off in your editor if they cause trouble. The Typed Text Check still reports any difference. Older settings and profile files without this setting load as Plain text. No new packages.",
+        ],
+    },
+    {
+        "version": "5.30.0",
+        "date": "2026-10-29",
+        "title": "Automatic tests",
+        "changes": [
+            "Added: a tests folder with 89 automatic checks for the parts of Amanuensis that must never break: protected text, bold and italic markers, pause markers, Markdown input, every Smart Text Fixes rule, settings checking, saving and loading settings, the typed text check, and Learn My Speed. They use Python's built-in unittest, so nothing new needs to be installed.",
+            "Added: a Tests job in the project's online checks, so every pull request runs the tests before it can be merged.",
+            "Fixed: typing nan, inf, or -inf into a number box (delays, pauses, break lengths, chances, strengths) was accepted, and could freeze or crash a typing run. Those words are now refused with the usual message, and strength and chance boxes go back to a safe number.",
+            "Notes: the app itself was not restructured to make it testable. No new settings and no new packages.",
+        ],
+    },
+    {
+        "version": "5.29.0",
+        "date": "2026-10-29",
+        "title": "Learn my speed",
+        "changes": [
+            "Added: a Learn My Speed button in the Typing Speed card on the Speed tab. It opens a small window where you type a short paragraph (a sample is shown, or type any paragraph you like). Amanuensis measures the time between your key presses and shows your typing speed in words per minute as you go.",
+            "Added: Use This Speed fills in Target WPM, Min Delay, and Max Delay for you, the same way Apply WPM does. It turns on after 40 key presses have been measured, and you can keep typing for a steadier result or press Start Over.",
+            "Modified: Apply WPM and Learn My Speed now share one function for turning a speed into Min and Max Delay, so the same speed always gives the same delays.",
+            "Notes: gaps longer than 2 seconds (thinking) and gaps around Backspace, Delete, arrow keys, and shortcuts are not counted, and pasting is blocked in the window, so only real typing is measured. The text typed in the window is never saved. No new settings and no new packages.",
+        ],
+    },
+    {
+        "version": "5.28.0",
+        "date": "2026-10-28",
+        "title": "Markdown and Word input",
+        "changes": [
+            "Added: you can now pick Markdown (.md) and Word (.docx) files as well as .txt files, for a single file or in the batch queue. The queue can mix all three types.",
+            "Added: in a Markdown file, **bold** and *italic* (also __bold__, _italic_, and ***both***) are turned into the bold and italic markers, so the text is bolded and italicized with Ctrl+B and Ctrl+I as it is typed. Headings, lists, links, and code are typed exactly as written.",
+            "Added: a Word file is read as plain text only. Paragraphs, line breaks, and tabs are kept. Fonts, bold, italic, pictures, list numbers, headers, and footnotes are left out.",
+            "Modified: the Browse and Add Files windows now show Text, Markdown, and Word files first, with separate choices for each type and All files.",
+            "Notes: a mark with no partner, spaced math like 2 * 3 * 4, snake_case words, and [[protected text]] are never changed by the Markdown step. A password-protected or damaged Word file shows a plain error instead of crashing. No new settings and no new packages.",
+        ],
+    },
+    {
+        "version": "5.27.0",
+        "date": "2026-10-28",
+        "title": "Auto-pause alert",
+        "changes": [
+            "Added: a beep when typing pauses by itself. If the locked window loses focus, or mouse movement triggers Auto-pause on activity, a short warning beep plays once, so you know without watching the screen. It also plays if focus is lost in the middle of a second revision pass fix. It is a different sound from the finished sound, and pausing yourself never beeps.",
+            "Added: one new setting (beep when typing pauses by itself), off by default, shown as a checkbox in the Alerts card on the Hotkeys tab. It is saved and restored on launch and is part of that card's Reset This Section button.",
+            "Modified: the On Completion card on the Hotkeys tab is now called Alerts, because it holds both kinds of alert.",
+            "Notes: a preview never beeps. The beep works on its own, even if the finished sound is off, and needs Windows sound. Like the finished alerts, a starter profile never changes it. Older settings load as off. No new packages.",
+        ],
+    },
+    {
+        "version": "5.26.0",
+        "date": "2026-10-23",
+        "title": "Preview playback speed",
+        "changes": [
+            "Added: a Playback speed list in the Preview Run window. Choose 1x, 1.25x, 1.5x, 1.75x, 2x, 3x, 5x, 10x, or 20x. The speed changes right away, even in the middle of a preview, so you can watch a long file in less time.",
+            "Modified: only the waiting is shortened. The same text, typos, reworks, and pauses happen in the same order, just sooner. Real typing is never sped up.",
+            "Added: one new setting (preview speed), saved and restored on launch.",
+            "Notes: the speed belongs to this computer, so shared profiles never carry it, loading a profile, an Auto Profile, or a starter profile never changes it, and Reset All Settings leaves it alone. Older settings load as 1x, and a value that is not one of the choices snaps to the nearest one. Pause markers count down faster in a preview. No new packages.",
+        ],
+    },
+    {
+        "version": "5.25.1",
+        "date": "2026-10-22",
+        "title": "Fix mistakes left behind",
+        "changes": [
+            "Fixed: sentence reworks and paraphrase drafts deleted words with Ctrl+Backspace, which editors disagree about (commas, apostrophes, and hyphens can count as word breaks), so text could be left behind or too much deleted. They now press Backspace exactly once for each character that was typed.",
+            "Fixed: double spaces, or a word cut off at the start of the rework memory, were changed by a rework. The exact text on screen is now deleted and typed again, so nothing changes.",
+            "Fixed: pressing Stop in the middle of a typo, a sentence rework, or a paraphrase draft could leave a wrong letter or a deleted sentence on screen. Each one now finishes putting things back before stopping, and Resume no longer types a doubled letter twice.",
+            "Notes: the Preview Run box now uses the same Backspace steps as a real run, so the preview text check matches what a real editor does. No settings changed and older settings and profile files load the same way. No new packages.",
+        ],
+    },
+    {
+        "version": "5.25.0",
+        "date": "2026-10-22",
+        "title": "Check typed text",
+        "changes": [
+            "Added: typed text check. When a run finishes, Amanuensis compares the text that is really on screen with the text it meant to type, and opens a Typed Text Check report if anything differs. The report lists each difference by line number, with what is on screen and what it should be, and has a Copy Report button.",
+            "Added: a preview run is always checked, by reading the Preview Run box, with no keys and no clipboard. For a real run, the new Check Typed Text card on the Hotkeys tab (off by default) copies everything before the cursor in the target window (Ctrl+Shift+Home, then Ctrl+C), compares it, collapses the selection with the Right arrow key, and puts your earlier clipboard text back. A View Last Text Check button opens the last report again.",
+            "Added: one new setting (check typed text), saved and restored on launch, with its own Reset This Section button.",
+            "Notes: purposely left mistakes (Leave Mistakes For Me) are expected, so they are not counted as differences. Text that was already in the document before the cursor is ignored. Curly quotes, non-breaking spaces, and spaces at the very end count as the same text, but an editor's own autocorrect can still show up as a difference. The check is skipped with a message if the target window is not in front or copying is blocked, and it never changes the typed text. The log records only counts and line numbers, never the text. The setting belongs to this computer, so shared profiles, Auto Profiles, and starter profiles never carry or change it. Older settings and profile files without it load as off. No new packages.",
+        ],
+    },
+    {
+        "version": "5.24.0",
+        "date": "2026-10-21",
+        "title": "Skip a research break",
+        "changes": [
+            "Added: Skip Break. While a research break is counting down, press the new Skip Break button in the footer (or the Skip Break hotkey, Ctrl+Alt+B by default) to end just that break, and typing carries on right away. Later breaks are not changed, and pressing it when no break is running does nothing, so it can never skip a break ahead of time.",
+            "Added: one new setting (hotkey_skip_break), shown on the Hotkeys tab, saved and restored on launch, and part of the Hotkeys reset.",
+            "Notes: a skipped break still counts as a break afterward (fatigue partly recovers, the mood resets, and the next break is planned as usual). The time really spent in the break is what is left out of WPM and ETA, and the run simply finishes sooner. The log records only research_break_skipped and the seconds. Like the other hotkeys, it belongs to this computer, so an auto-picked or starter profile never changes it. No new packages.",
+        ],
+    },
+    {
+        "version": "5.23.1",
+        "date": "2026-10-21",
+        "title": "Shorter README",
+        "changes": [
+            "Modified: the README now lists only the key features, in a short Key features section. The full list of every feature and setting moved to docs/FEATURES.md, and the README links to it.",
+            "Added: docs/FEATURES.md, with all the features grouped by topic. It also lists two features the README had left out (Warm-up after breaks and Writing habits).",
+            "Notes: nothing in the app itself changed, so no settings changed and older files load the same way. The version in pyproject.toml and uv.lock was still 5.22.0, and is now 5.23.1 to match this history. No new packages.",
+        ],
+    },
+    {
+        "version": "5.23.0",
+        "date": "2026-10-20",
+        "title": "App text size",
+        "changes": [
+            "Added: app text size. A new Text Size card on the Window tab makes the text, buttons, boxes, and pop-up windows of the whole app larger, which helps people who find small text hard to read. Choose 100%, 125%, 150%, 175%, or 200%. 100% is the normal size and the default.",
+            "Added: one new setting (the text size), saved and restored on launch.",
+            "Notes: like the theme, the new size takes effect the next time Amanuensis launches, and a message says so. The size belongs to this computer, so shared profiles never carry it, loading a profile, an Auto Profile, or a starter profile never changes it, and Reset All Settings leaves it alone. Older settings and profile files without it load as 100%, and a value that is not a number goes back to 100%. If a size is too big for the screen, the next launch warns and picks the largest size that fits, instead of leaving the buttons cut off. Compact view and the pop-up windows grow with the size. No new packages.",
+        ],
+    },
+    {
+        "version": "5.22.0",
+        "date": "2026-10-20",
+        "title": "Starter profiles",
+        "changes": [
+            "Added: starter profiles. Four built-in typing styles (Careful student, Fast typist, Tired late night, and Hands-free dictation) so a new person can start with a good setup. Pick one in the new Starter Profiles part of the Profiles card on the Data tab and press Load Starter Profile.",
+            "Added: a short description under the list that changes with the choice, and a confirmation before anything is replaced.",
+            "Notes: a starter profile sets the typing style (speed, mistakes, breaks, pauses, and the realism cards) and puts every other typing setting back to its default. Hotkeys, theme, update settings, the session log, completion alerts, activity auto-pause, start countdown, target time, the input file and queue, Auto Profile rules, and the Scheduled Start stay as they are. The starter profiles live in the code, not in the profiles folder, so they never show up as files and cannot be changed or damaged. Loading is refused during a run, and if anything goes wrong the earlier settings are put back. There are no new settings, so nothing new is saved and older files load the same way. No new packages.",
+        ],
+    },
+    {
+        "version": "5.21.0",
+        "date": "2026-10-19",
+        "title": "Scheduled start",
+        "changes": [
+            "Added: scheduled start. Pick a clock time, check the box, and press Start Typing. Amanuensis waits until that time and then starts on its own, using the normal start countdown. A time that has already passed today means the same time tomorrow.",
+            "Added: a Scheduled Start card on the Window tab with two new settings (on or off, and the start time, 9:00 AM by default), saved and restored on launch but never saved in shared profiles. It has a Cancel Scheduled Start button and its own Reset This Section button. The Stop button and the Stop hotkey also cancel the wait.",
+            "Added: a confirmation before waiting. It shows the exact start time and how long the wait is, warns when no target window is locked, and warns that the computer must stay awake and unlocked.",
+            "Notes: while waiting, Amanuensis asks Windows not to go to sleep on its own, and lets go when the wait ends. It cannot stop a closed lid, a manual Sleep, or a locked screen. If the computer wakes more than 5 minutes after the start time, the run is cancelled with a message instead of typing late. The box unchecks itself once the wait ends, so the next Start types right away. The wait happens once, before the first file of a batch. Moving the mouse while waiting does not pause anything. Preview ignores the schedule. Older settings and profile files without these settings load as off. The log records only the clock time. No new packages.",
+        ],
+    },
+    {
+        "version": "5.20.0",
+        "date": "2026-10-19",
+        "title": "Warm-up after breaks",
+        "changes": [
+            "Added: warm-up after breaks. A typist does not come back from a break at full speed. After a research break, a long session break, a long pause marker, a long natural pause, or a long pause by you, the first 20 or so characters are typed a little slower (about 30% slower on the first key) and the speed eases back to normal.",
+            "Added: a Warm-Up After Breaks card on the Speed tab with two new settings (on or off, and a strength from 0 to 200 percent, 100 by default), saved with your profiles and restored on launch. It has its own Reset This Section button.",
+            "Modified: the pre-start time estimate includes the average effect of research breaks and long paragraph or sentence pauses.",
+            "Notes: a wait of 8 seconds or more starts a warm-up, so the short planned pauses never do. Only the speed changes, never the typed text, and no pause is added. Protected text types at the normal speed but still counts toward the 20 characters. It stacks with flow and hesitation, essay pace, uneven rhythm, finger timing, and fatigue. A run or a resume starts with no warm-up. Session breaks and pause markers are not in the estimate, since they are not averages. The log records only the reason and the spot, never the words. Older settings and profile files without these settings load as on at 100%.",
+        ],
+    },
+    {
+        "version": "5.19.0",
+        "date": "2026-10-19",
+        "title": "Capital letter slips",
+        "changes": [
+            "Added: capital letter slips. A typist sometimes lets a letter come out as a capital in the middle of a word, like \"tHe\", notices it, and fixes it. Amanuensis now does the same, so some of the regular typos are capital slips instead of wrong-key slips.",
+            "Added: a Capital letter slips checkbox in the Character Typos card on the Mistakes tab with one new setting (on by default), saved with your profiles and restored on launch. It is part of the existing Character Typos reset.",
+            "Added: a new kind in Leave Mistakes For Me, Wrong capital letter, inside the Typos group. It leaves one capital in the middle of a word, like the H in \"tHe\", for you to fix, and it shows up in the mistake list.",
+            "Notes: capital slips share the typo chance, so the number of typos and the time estimate do not change. About 1 in 5 typos is a capital slip when the letter allows it. Only plain a to z letters inside a word are used, never the first letter and never protected text. The typed text always ends up the same. Older settings and profile files without this setting load as on. With Use extra typo types on, the slip is noticed after 1 to 3 more letters, like the other typos. No new packages.",
+        ],
+    },
+    {
+        "version": "5.18.0",
+        "date": "2026-10-19",
+        "title": "Custom start countdown",
+        "changes": [
+            "Added: a custom start countdown. The wait before typing begins used to be fixed at 10 seconds. You can now set it from 0 to 60 seconds, so you can have more time to click into the target window, or none at all when the window is already ready.",
+            "Added: a Start Countdown card on the Window tab with one new setting (whole seconds from 0 to 60, 10 by default), saved with your profiles and restored on launch. It has its own Reset This Section button.",
+            "Modified: each file in a batch queue gets the countdown, and the batch time estimate uses the length you chose for each file instead of a fixed 10 seconds.",
+            "Notes: a box that cannot be read as a number goes back to 10, and a number outside 0 to 60 is pulled back into range, with the box corrected to match. Older settings and profile files without this setting load as 10, so nothing changes for them. 0 skips the wait completely. Preview runs still skip the countdown. The short warning after a long session break is separate and unchanged. No new packages.",
+        ],
+    },
+    {
+        "version": "5.17.0",
+        "date": "2026-10-18",
+        "title": "A changing pace across the essay",
+        "changes": [
+            "Added: essay pace. A writer does not keep one pace from the first line to the last. The opening is typed a little slower (about 10 percent) and stops now and then to plan. Once the argument is set, the body speeds up (about 8 percent quicker). The closing slows down again (about 12 percent slower) with a few stops to decide how to end. Files of 1,200 characters or more get this, and shorter files are left alone.",
+            "Added: an Essay Pace card on the Speed tab with two new settings (on or off, and Pace Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the speed change and the average opening and closing pauses. Session break planning now measures each stretch of text by its place in the whole file.",
+            "Notes: the opening is the first 15 percent of the file and the closing is the last 15 percent. The speed eases between zones so it never jumps, and the quicker body balances the slower ends, so the total time barely moves. The pace uses no randomness. The pauses are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text always types at the normal speed and never gets a pause, and there is no pause at the very start of the file or where another pause is already planned. Only the speed and pauses change, never the typed text. The session log records only counts and spots, never the words.",
+        ],
+    },
+    {
+        "version": "5.16.0",
+        "date": "2026-10-18",
+        "title": "Punctuation and formatting habits",
+        "changes": [
+            "Added: writing habits. A writer has habits, and they stay the same all the way through. Amanuensis now gives each file its own set. The typist may always stop for a moment before an opening parenthesis or a dash used as an aside, before an opening quotation mark, or before a heading and the first line under it. Each of those three is none, light, or strong for the file, and at least two are always real habits. Commas are typed quick, even, or slow (half, normal, or one and a half times the usual comma pause).",
+            "Added: a Writing Habits card on the Speed tab with two new settings (on or off, and Habit Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average habit pauses and the change in comma time. Semicolons and colons are unchanged.",
+            "Notes: the habits are worked out from the text itself, with no fresh random draw, so the same file always gets the same habits and resuming keeps them. The spots are planned once before typing starts, only for text that is still to be typed. Protected text never gets a pause, and there is none at the very start of the file or where a pause marker, a difficulty pause, a decision pause, or a burst pause already is. A heading is a short line with blank lines around it that does not end like a sentence, or a line that starts with #. Bullet lines are never headings. The typed text never changes. The session log records the habit levels, the spot, and the kind, never the words.",
+        ],
+    },
+    {
+        "version": "5.15.0",
+        "date": "2026-10-17",
+        "title": "Revision clusters",
+        "changes": [
+            "Added: revision clusters. Real revising bunches together: a writer changes a phrase, fixes a few more things in a row, then drafts calmly for a while. Amanuensis now groups its typos, sentence reworks, drafted paraphrases, second revision words, and select and retype words into short stretches of about 70 to 220 characters that start at the beginning of a sentence. Outside those stretches the typing is calmer.",
+            "Added: a Revision Clusters card on the Mistakes tab with three new settings (on or off, Cluster Strength from 0 to 200 percent, and a revision style: Mixed, Edit as I go, or Draft, then revise), on by default, saved with your profiles and restored on launch.",
+            "Modified: second revision pass and select and retype now pick a word inside a cluster when the paragraph has one.",
+            "Notes: the typo chance, the sentence rework count, and the paraphrase chance are raised inside a cluster and lowered outside it, with the two weights worked out so the average stays the same. You get about the same number of mistakes overall, so the time estimate does not change. Clusters are planned once before typing starts, only for text that is still to be typed, so resuming works, and only in paragraphs of 160 characters or more. Edit as I go spreads clusters through each paragraph. Draft, then revise keeps the start of a paragraph calm and puts one cluster at its end. Protected text is never touched. The session log records only how many clusters were planned, never the words. No new packages.",
+        ],
+    },
+    {
+        "version": "5.14.0",
+        "date": "2026-10-16",
+        "title": "Uneven rhythm",
+        "changes": [
+            "Added: uneven rhythm. Amanuensis no longer types to one steady beat. Everyday words and familiar phrases (like of the, as well as, or a lot of) now come out about 15 percent quicker. Names in the middle of a sentence, hard or technical words, numbers, acronyms, punctuation marks (commas, colons, brackets, quote marks, question and exclamation marks), and carefully hedged claims (words like perhaps and might, or phrases like tends to and in some cases) come out about 20 to 30 percent slower.",
+            "Added: an Uneven Rhythm card on the Speed tab with two new settings (on or off, and Rhythm Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average change. It is small, because the quicker and slower parts mostly balance out.",
+            "Notes: only the speed of a key changes. No pause is added and the typed text never changes. The text is scanned once before typing starts, only for text that is still to be typed, so resuming works. Protected text always types at the normal speed. The change stacks with flow and hesitation, finger timing, and fatigue drift. The session log only records how many characters of each kind were planned, never the words.",
+        ],
+    },
+    {
+        "version": "5.13.0",
+        "date": "2026-10-16",
+        "title": "Pauses at decision points",
+        "changes": [
+            "Added: decision pauses. Amanuensis now stops for a moment at the spots where a writer has to decide something: before a new paragraph, before a sentence that states a claim (one that starts with a phrase like I believe, this shows, or the evidence), and before a transition such as however, for example, or in conclusion. A transition word right after a semicolon counts too. Hard words already had their own pause, so they are not repeated here.",
+            "Added: a Decision Pauses card on the Speed tab with two new settings (on or off, and Pause Strength from 0 to 300 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average time of these pauses. They are about 0.8 to 3 seconds and not every spot pauses. Burst pauses now skip a spot that already has a decision pause.",
+            "Notes: the pause spots are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text never gets a pause, and there is none at the very start of the file or where a pause marker or a difficulty pause already is. A claim or transition pause is skipped when the sentence before it already had one. The Natural Pauses after a paragraph break still happen first. The session log records only the spot and kind, never the words.",
+        ],
+    },
+    {
+        "version": "5.12.0",
+        "date": "2026-10-16",
+        "title": "Bursts followed by pauses",
+        "changes": [
+            "Added: typing bursts. Amanuensis now types a phrase, stops for a moment, then types the next phrase, instead of running through a whole sentence without a break. Bursts are longer (about 8 to 16 words) when the wording is plain and familiar, and shorter (about 3 to 7 words) in a sentence that needs more thought, such as one with a hard word, an argument word like \"because\" or \"however\", or many commas. A burst often ends at a comma when one is close.",
+            "Added: a Typing Bursts card on the Speed tab with two new settings (on or off, and Pause Strength from 0 to 300 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average time of these pauses. They are short (about 0.3 to 1.4 seconds) and not every burst ends with one.",
+            "Notes: the pause spots are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text never gets a pause, and there is no burst pause at the start of a sentence or paragraph, or where a pause marker or a difficulty pause already is. The session log records only the spot and length, never the words.",
+        ],
+    },
+    {
+        "version": "5.11.0",
+        "date": "2026-10-15",
+        "title": "Faster launch",
+        "changes": [
+            "Modified: the main window now stays hidden while the app builds its screens, and appears once when everything is ready. Before, the window could already be on screen while it was still being built, so it had to redraw as each section was added.",
+            "Notes: nothing about typing, settings, or profiles changed, and there are no new packages. In a test on Linux the launch was about 10 percent faster, and Windows was not measured, so the speed-up you see may be different. Most of the remaining launch time is spent creating the rounded buttons, boxes, and cards, which cannot be removed without a bigger change. Building each tab only when you first open it is the next idea, and it would be planned first.",
+        ],
+    },
+    {
+        "version": "5.10.0",
+        "date": "2026-10-14",
+        "title": "Select and retype, plus overshoot",
+        "changes": [
+            "Added: Select & Retype. Right after finishing a word, Amanuensis can decide it was the wrong word. One word is first typed as a close synonym. Then the typist holds Shift and taps the Left arrow key once per letter to highlight the word, and types the real word over it.",
+            "Added: Overshoot. After a typo is backspaced away, the typist sometimes presses Backspace one time too many, pauses as if noticing, and types that letter again.",
+            "Added: a Select, Retype & Overshoot card on the Mistakes tab with four new settings: select and retype (off by default, 20 percent per paragraph) and overshoot (on by default, 30 percent of typo fixes). All are saved with profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes both. Preview shows the change in the preview box without pressing any keys.",
+            "Notes: your text always ends up exactly as in the file. The selection uses exactly the letters of the word just typed. Only plain words are used, never next to protected text, bold or italic markers, or purposely left mistakes. Overshoot only touches the one letter before the cursor, is skipped next to bold or italic text, and always puts the letter back, even if you press Stop. If you press Stop in the middle of a select and retype, a message tells you what to fix by hand. The log never records the words. Select and retype needs an editor where Shift+Left highlights text. No new packages.",
+        ],
+    },
+    {
+        "version": "5.9.0",
+        "date": "2026-10-14",
+        "title": "Second revision pass",
+        "changes": [
+            "Added: Second Revision Pass. At the end of a paragraph, Amanuensis can go back to an earlier word, change it, and return to where it was. One word is first typed as a close synonym. When the paragraph is done, the typist presses the Left arrow key to go back, deletes the word, types the real one, and presses the Right arrow key the same number of times to return. This is the first time the app uses arrow keys.",
+            "Added: a Second Revision Pass card on the Mistakes tab with a switch (off by default) and a chance per paragraph (25 percent by default, 0 to 100). Both are saved with profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the trips back. Preview shows the change in the preview box without pressing any keys.",
+            "Notes: your text always ends up exactly as in the file. Only plain words 30 to 250 characters from the end of the paragraph are used, and a paragraph is skipped if the text after the word has protected text, symbols an editor might change, bold or italic markers, or a purposely left mistake. No progress checkpoint is saved while a word is waiting to be fixed, and if you press Stop then, a message tells you what to change by hand. The log records only the distance, never the words. It needs an editor where the arrow keys move the cursor. No new packages.",
+        ],
+    },
+    {
+        "version": "5.8.0",
+        "date": "2026-10-14",
+        "title": "Updates install in place",
+        "changes": [
+            "Added: Update and Restart. In the packaged .exe, the update prompt now downloads the new version, checks it against the checksum GitHub published, replaces the app you are running, and opens the new version. There is no second .exe to swap in by hand anymore.",
+            "Modified: your settings, profiles, and saved progress stay, because the new file takes the old file's place in the same folder. A typing run is never interrupted, and if a run starts while the download is going, the update waits for you to check again.",
+            "Modified: the plain Download button is still used when you run Amanuensis from source code, when its folder cannot be written to (like Program Files), or when a release has no checksum to check against.",
+            "Notes: the running .exe is renamed to .old and the new file takes its name. If any step fails, the old file is put back and you keep your current version. Leftover .old and .new files are deleted a few seconds after the next launch. No new settings or packages.",
+        ],
+    },
+    {
+        "version": "5.7.0",
+        "date": "2026-10-13",
+        "title": "Auto-pick a profile by window",
+        "changes": [
+            "Added: an Auto Profile by Window card on the Window tab. Add rules that pair some words from a window title (like \"Google Docs\") with a saved profile. When a run starts, the first rule whose words appear in the target window's title loads that profile, so each program gets its own typing style.",
+            "Added: two new settings (on or off, and the list of rules), off and empty by default, restored on launch.",
+            "Modified: the target window is the locked window if Lock typing is on, otherwise the window that was active when you pressed the Start hotkey. Clicking the Start button makes Amanuensis itself active, so use the hotkey or lock a window.",
+            "Notes: rules are never saved into profiles and are ignored when a profile is loaded, because window titles can be personal. A rule can only use a file from the profiles folder, and an auto-picked profile never changes your hotkeys, theme, or update settings. The session log records only the profile name, never the window title. Preview and the time estimate do not switch profiles.",
+        ],
+    },
+    {
+        "version": "5.6.0",
+        "date": "2026-10-13",
+        "title": "Flow and hesitation states",
+        "changes": [
+            "Added: typing moods. Amanuensis now drifts between normal, flow (a stretch typed about 15 percent faster), and hesitant (a stretch typed about 25 percent slower). Each stretch lasts a few dozen to a few hundred characters, and the speed eases in and out so it never jumps.",
+            "Added: a Flow & Hesitation card on the Speed tab with two new settings (on or off, and Mood Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the small average change. A session break or research break puts the typist back in the normal state.",
+            "Notes: moods change speed only, with no extra pauses, typos, or reworks, and they stack with fatigue drift. Resuming starts in the normal state. The session log records only the mood and the position.",
+        ],
+    },
+    {
+        "version": "5.5.0",
+        "date": "2026-10-13",
+        "title": "Difficulty-aware thinking pauses",
+        "changes": [
+            "Added: thinking pauses that depend on how hard the text is. Amanuensis stops for a moment before a hard word (long, many syllables, numbers, an acronym, or rare letters) and for a little longer before a very long or packed sentence.",
+            "Added: a Difficulty Pauses card on the Speed tab with two new settings (on or off, and Pause Strength from 0 to 300 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average time of these pauses. Not every hard word pauses, there are always a few words between word pauses, and common long words like \"important\" never count as hard.",
+            "Notes: the pause spots are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text never gets a pause. The session log records only the spot and length, never the words.",
+        ],
+    },
+    {
+        "version": "5.4.0",
+        "date": "2026-10-13",
+        "title": "Formatting markers",
+        "changes": [
+            "Added: bold and italic markers. Wrap text in [[b]]...[[/b]] or [[i]]...[[/i]] and Amanuensis presses Ctrl+B or Ctrl+I at those spots, so the text comes out bold or italic in Google Docs or Word. The markers are never typed.",
+            "Added: a Formatting Markers card on the Speed tab with one new setting, on by default, saved with your profiles and restored on launch. When it is off, the markers are still removed but no shortcuts are pressed (handy for plain web forms).",
+            "Added: a warning before typing starts if a marker has no partner (a stray closing marker, a repeated opening marker, or one that is never closed).",
+            "Modified: the pre-start time estimate includes the time for each shortcut. Reworks never delete the first formatted word, and no typo, paraphrase, or left mistake can lose or move a formatting change.",
+            "Notes: [[b]], [[/b]], [[i]], and [[/i]] are now reserved, so protected text cannot be exactly b or i. Preview does not press shortcuts. An unclosed marker is closed after the last character. When resuming, click right after the last typed character so the formatting carries on.",
+        ],
+    },
+    {
+        "version": "5.3.0",
+        "date": "2026-10-12",
+        "title": "Finger and hand timing",
+        "changes": [
+            "Added: a Finger & Hand Timing card on the Speed tab. Two letters typed with opposite hands in a row come a little sooner, and two different letters typed with the same finger (like \"ed\" or \"lo\") come a little later, like on a real keyboard.",
+            "Added: one new setting (enable finger and hand timing), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the small net change. The 16 common letter pairs keep their quick fixed speed.",
+            "Notes: only letter-to-letter pairs change. Spaces, numbers, punctuation, and doubled letters keep their normal timing, and fatigue drift is applied after this change.",
+        ],
+    },
+    {
+        "version": "5.2.0",
+        "date": "2026-10-12",
+        "title": "Resume across sessions",
+        "changes": [
+            "Added: resume_state.json v2 format storing typing progress per file, keyed by normalized path.",
+            "Added: SHA-256 prefix hash validation to detect if text before the stopping point changed.",
+            "Added: autosave checkpoint at sentence-ending punctuation (. ! ? and newlines) while typing, so recovery works even if the app closes unexpectedly.",
+            "Added: saved progress status line and Clear Saved Progress button with confirmation in the Input File card.",
+            "Added: atomic writes using temporary files and a background-thread lock to prevent file corruption.",
+        ],
+    },
+    {
+        "version": "5.1.0",
+        "date": "2026-10-11",
+        "title": "Target time till completion",
+        "changes": [
+            "Added: a Target Time card on the Speed tab. Pick how long the whole run should take, in hours and minutes. The spare time is spent on long session breaks, like someone writing over several sittings instead of all at once.",
+            "Added: a longer target means more and longer breaks. A target of several hours can include breaks of an hour or more. Breaks happen at the start of a paragraph or sentence, never inside protected text.",
+            "Added: break lengths adjust as the run goes, so the run finishes close to your target. Time you spend paused yourself is not counted.",
+            "Added: the pre-start time estimate describes the plan, and a warning appears before typing starts if the target is shorter than the typing time.",
+            "Added: three new settings (enable, hours, minutes), saved with your profiles and restored on launch.",
+            "Modified: with a batch queue, the target is for the whole run and is shared between the files by size. The ETA follows the plan while long breaks are still ahead.",
+            "Notes: Preview ignores the target. Amanuensis never types faster than your speed settings, so a target that is too short cannot be reached. Keep the computer awake during a long run, and turn on Target Window Lock so typing never lands in the wrong window after a break.",
+        ],
+    },
+    {
+        "version": "5.0.2",
+        "date": "2026-10-11",
+        "title": "Release notes from version history",
+        "changes": [
+            "Added: the description on each GitHub release page is now written automatically from the newest version history entry, so the code, this History tab, and the release page always match.",
+            "Modified: a release now stops before publishing if the newest history entry is missing or its version does not match the tag.",
+            "Notes: no change to how the app works, no new settings, and no new packages.",
+        ],
+    },
+    {
+        "version": "5.0.1",
+        "date": "2026-10-10",
+        "title": "Guard invalid saved settings",
+        "changes": [
+            "Fixed: malformed or non-dictionary saved settings/profile JSON is ignored instead of crashing the app.",
+            "Fixed: invalid saved profile values are skipped before applying them, so the app falls back to safe defaults.",
+        ],
+    },
+    {
+        "version": "5.0.0",
+
+        "date": "2026-10-10",
+        "title": "Public release preparation",
+        "changes": [
+            "Added: exported session logs now stop spreadsheet programs from running log text as a formula, and the log records only the input file's name instead of its full folder path.",
+            "Added: saved profiles no longer include folder paths, and loading a profile ignores them, so profiles are safe to share.",
+            "Modified: a damaged or hand-edited settings or profile file is now rejected with a message (or quietly ignored at startup) instead of crashing the app.",
+            "Modified: the update prompt double-checks the GitHub address before opening it in your browser.",
+            "Fixed: removed an unused variable that made the automatic code check report a warning.",
+            "Notes: the project is ready for public release, with a security policy, contributor rules, automatic dependency and code scanning, and release checksums you can verify. See SECURITY.md.",
+        ],
+    },
+    {
+        "version": "4.4.0",
+        "date": "2026-10-10",
+        "title": "Update prompts",
+        "changes": [
+            "Added: an Updates card on the Data tab. The app can check GitHub for a newer version when it starts, and a Check for Updates Now button checks any time.",
+            "Added: when a newer version exists, a prompt lets you download it, visit the GitHub page, skip that version, or wait until later.",
+            "Added: downloads are saved as a separate file next to the app, checked against GitHub's checksum, and never replace or restart the app by themselves.",
+            "Added: two new settings (check on startup, skipped version).",
+            "Notes: only a version number is requested. Nothing from your text or settings is sent. The prompt never appears while a run is active.",
+        ],
+    },
+    {
+        "version": "4.3.0",
+        "date": "2026-10-09",
+        "title": "Leave Mistakes For Me",
+        "changes": [
+            "Added: Leave Mistakes For Me card on the Mistakes tab. It purposely leaves a few mistakes in the typed text for you to find and fix yourself. Off by default.",
+            "Added: three groups you can turn on or off: typos (wrong, swapped, doubled, or missing letters, and joined words), missing commas, and missing punctuation (periods, ? ! and apostrophes).",
+            "Added: a Mistakes Left For You window that opens when the run ends. It lists each mistake with its line number, what is on screen, and what it should be. You can copy it or save it as a text file.",
+            "Added: a live Mistakes left count in the status line, and a View Last Mistake List button.",
+            "Notes: mistakes are spread out across the file and never touch [[protected text]], web addresses, emails, paths, or numbers. The typer never fixes a left mistake by accident.",
+        ],
+    },
+    {
+        "version": "4.2.0",
+        "date": "2026-10-09",
+        "title": "Version History tab",
+        "changes": [
+            "Added: a History tab that shows the 10 newest releases, newest first.",
+            "Added: a Current Version card at the top of the History tab.",
+        ],
+    },
+    {
+        "version": "4.1.0",
+        "date": "2026-10-09",
+        "title": "Smart Text Fixes",
+        "changes": [
+            "Added: Smart Text Fixes card on the Mistakes tab. Local, rule-based proofreading with no AI and no internet.",
+            "Added: fixes for extra, trailing, and missing spaces, spaces before punctuation, missing commas after openers like \"However\", missing end-of-paragraph periods, doubled punctuation, sentence capitalization, a lowercase \"i\", and repeated words.",
+            "Added: four on/off groups (off by default), a \"Show fixes being noticed\" chance, and a Review Fixes button that lists every planned change.",
+            "Notes: text inside [[protected markers]] is never changed.",
+        ],
+    },
+    {
+        "version": "4.0.0",
+        "date": "2026-10-08",
+        "title": "Whole app converted to CustomTkinter",
+        "changes": [
+            "Modified: every part of the interface now uses the rounded CustomTkinter look, including the pop-up windows and message dialogs.",
+            "Modified: entry, text, and dropdown borders are thicker, and Reset All Settings is red.",
+            "Removed: the old ttk fallback. CustomTkinter is now a required package.",
+        ],
+    },
+    {
+        "version": "3.23.0",
+        "date": "2026-10-07",
+        "title": "Darker borders and red Reset buttons",
+        "changes": [
+            "Modified: entry boxes and checkboxes on the Hotkeys tab have a thicker, darker outline.",
+            "Modified: every Reset This Section button is red.",
+            "Notes: CustomTkinter adopted as the standard look.",
+        ],
+    },
+    {
+        "version": "3.22.0",
+        "date": None,
+        "title": "CustomTkinter look test",
+        "changes": [
+            "Added: a rounded CustomTkinter look test on the Hotkeys tab.",
+        ],
+    },
+    {
+        "version": "3.21.0",
+        "date": None,
+        "title": "Six topic tabs",
+        "changes": [
+            "Modified: settings are split across six tabs (Input, Window, Speed, Mistakes, Hotkeys, Data) with 1 to 3 related cards each.",
+            "Modified: the window size is measured from all of the tabs.",
+        ],
+    },
+    {
+        "version": "3.20.0",
+        "date": None,
+        "title": "Window opens at the right size",
+        "changes": [
+            "Fixed: the window opened too small and cut off text. It now measures the real content at startup, opens centered, and never opens bigger than the screen.",
+            "Modified: compact mode is sized from the measured header and footer.",
+        ],
+    },
+    {
+        "version": "3.19.0",
+        "date": None,
+        "title": "Reset buttons",
+        "changes": [
+            "Added: a Reset This Section button on every settings card.",
+            "Added: Reset All Settings in Profiles.",
+        ],
+    },
+    {
+        "version": "3.17.0",
+        "date": None,
+        "title": "Inline pause markers",
+        "changes": [
+            "Added: {{pause:N}} markers that force a pause at an exact spot in the text. Decimals work, with a 600 second cap.",
+            "Added: an \"Enable inline pause markers\" toggle in the Natural Pauses card.",
+            "Added: a warning before the run for markers that are invalid, which are typed as plain text.",
+        ],
+    },
+    {
+        "version": "3.16.0",
+        "date": None,
+        "title": "More typo types",
+        "changes": [
+            "Added: a \"Use extra typo types\" toggle for swapped letters, doubled letters, and missed spaces.",
+            "Added: a delayed notice and backspace correction, like a real person catching it late.",
+        ],
+    },
+    {
+        "version": "3.15.0",
+        "date": None,
+        "title": "Fatigue drift",
+        "changes": [
+            "Added: optional fatigue drift. Typing slowly gets slower over a long session, with a configurable slowdown percentage.",
+            "Added: partial recovery after a research break, and time estimates that include the slowdown.",
+        ],
+    },
+    {
+        "version": "3.14.0",
+        "date": None,
+        "title": "Activity auto-pause",
+        "changes": [
+            "Added: typing pauses when the real mouse moves during a run, with a configurable pixel sensitivity and a normal resume control.",
+        ],
+    },
+    {
+        "version": "3.13.0",
+        "date": None,
+        "title": "Automatic releases",
+        "changes": [
+            "Added: a GitHub Actions workflow that builds the Windows .exe when a version tag is pushed and attaches it to the GitHub Release.",
+        ],
+    },
+    {
+        "version": "3.12.0",
+        "date": None,
+        "title": "Research break countdown",
+        "changes": [
+            "Added: a live countdown in the status line during research breaks.",
+        ],
+    },
+    {
+        "version": "3.11.0",
+        "date": None,
+        "title": "All characters supported",
+        "changes": [
+            "Fixed: em dashes, en dashes, curly quotes, ellipses, and other non-ASCII characters are now typed correctly.",
+        ],
+    },
+    {
+        "version": "3.10.0",
+        "date": None,
+        "title": "Paragraph paraphrase and correct",
+        "changes": [
+            "Added: at the end of a paragraph, the app can go back, reword a sentence with synonyms, then correct it to the original text by deleting words and retyping.",
+        ],
+    },
+    {
+        "version": "3.9.0",
+        "date": None,
+        "title": "Preview Run",
+        "changes": [
+            "Added: a Preview Run button that shows the mistakes and pauses in a small window without sending any real keystrokes.",
+        ],
+    },
+    {
+        "version": "3.8.0",
+        "date": None,
+        "title": "Dark mode",
+        "changes": [
+            "Added: Light and Dark color palettes with a header toggle button. The choice applies on the next launch.",
+        ],
+    },
+    {
+        "version": "3.7.0",
+        "date": None,
+        "title": "Session log viewer",
+        "changes": [
+            "Added: View Last Session Log and Open Log File buttons that show past CSV logs in a table inside the app.",
+        ],
+    },
+    {
+        "version": "3.6.0",
+        "date": None,
+        "title": "Paste text directly",
+        "changes": [
+            "Added: an \"Or paste text directly\" box and a Use Pasted Text button, so a .txt file is not required.",
+        ],
+    },
+    {
+        "version": "3.5.0",
+        "date": None,
+        "title": "Batch mode",
+        "changes": [
+            "Added: an Input File card with a queue of files that run one after another.",
+            "Added: a countdown and resume support for each file, and a single notification at the end.",
+        ],
+    },
+    {
+        "version": "3.3.0",
+        "date": None,
+        "title": "Completion alerts, compact mode, license",
+        "changes": [
+            "Added: an On Completion card with a notification and a sound, as separate toggles.",
+            "Added: a Compact button in the header for a small status-only view.",
+            "Added: the MIT license.",
+        ],
+    },
+]
+
+# Always read from the newest entry so the version shown in the app and the
+# list above can never disagree.
+APP_VERSION = VERSION_HISTORY[0]["version"]
+
+# --------------------------------------------
+# TABBED SETTINGS (fills remaining space above the footer)
+# --------------------------------------------
+TAB_TITLES = ["Input", "Window", "Speed", "Mistakes", "Hotkeys", "Data", "History"]
+notebook, tab_pages, tab_selector = make_tab_area(window, TAB_TITLES)
+notebook.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+
+
+def make_scrollable_tab(parent):
+    """Wrap a notebook tab in a scrollable canvas.
+
+    Root cause note: a tab can stack several cards, and their
+    combined natural height doesn't reliably fit in a fixed-height
+    window across different screens/DPI settings. Tk doesn't shrink
+    or warn when that happens -- it silently stops drawing whatever
+    doesn't fit. This makes the tab scrollable so nothing can be
+    silently clipped again.
+    """
+    outer = tk.Frame(parent, bg=PALETTE["bg"])
+    outer.pack(fill="both", expand=True)
+
+    canvas = tk.Canvas(outer, bg=PALETTE["bg"], highlightthickness=0)
+    scrollbar = modern_scrollbar(outer, canvas.yview)
+    inner = tk.Frame(canvas, bg=PALETTE["bg"], padx=4, pady=10)
+
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    def _on_enter(_event):
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+    def _on_leave(_event):
+        canvas.unbind_all("<MouseWheel>")
+
+    canvas.bind("<Enter>", _on_enter)
+    canvas.bind("<Leave>", _on_leave)
+
+    return inner, canvas
+
+
+# One page per topic (Idea #20), built by make_tab_area() above. Every page is
+# wrapped in its own scrollable canvas, exactly like the old two tabs were.
+tab_frames = {}     # tab title -> inner frame that cards are placed in
+tab_canvases = {}   # tab title -> its scroll canvas
+
+for _tab_title in TAB_TITLES:
+    tab_frames[_tab_title], tab_canvases[_tab_title] = make_scrollable_tab(tab_pages[_tab_title])
+
+tab_input = tab_frames["Input"]
+tab_window = tab_frames["Window"]
+tab_speed = tab_frames["Speed"]
+tab_mistakes = tab_frames["Mistakes"]
+tab_hotkeys = tab_frames["Hotkeys"]
+tab_data = tab_frames["Data"]
+tab_history = tab_frames["History"]
+tab_window_canvas = tab_canvases["Window"]
+
+
+# --- Tab: Input ---
+frame_file = make_modern_card(tab_input, "Input File")
+
+# --- Tab: Window (keeps typing going to the right place) ---
+frame_window = make_modern_card(tab_window, "Target Window Lock")
+frame_editor_type = make_modern_card(tab_window, "Editor Type")
+frame_start_countdown = make_modern_card(tab_window, "Start Countdown")
+frame_scheduled_start = make_modern_card(tab_window, "Scheduled Start")
+frame_auto_profile = make_modern_card(tab_window, "Auto Profile by Window")
+frame_activity = make_modern_card(tab_window, "Activity Auto-Pause")
+frame_text_size = make_modern_card(tab_window, "Text Size")
+
+# --- Tab: Speed (how fast and how steadily it types) ---
+frame_settings = make_modern_card(tab_speed, "Typing Speed")
+frame_target_time = make_modern_card(tab_speed, "Target Time")
+frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
+frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
+frame_key_timing = make_modern_card(tab_speed, "Key Press Timing")
+frame_typing_moods = make_modern_card(tab_speed, "Flow & Hesitation")
+frame_uneven_rhythm = make_modern_card(tab_speed, "Uneven Rhythm")
+frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
+frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
+frame_typing_bursts = make_modern_card(tab_speed, "Typing Bursts")
+frame_decision_pauses = make_modern_card(tab_speed, "Decision Pauses")
+frame_writing_habits = make_modern_card(tab_speed, "Writing Habits")
+frame_essay_pace = make_modern_card(tab_speed, "Essay Pace")
+frame_warmup = make_modern_card(tab_speed, "Warm-Up After Breaks")
+frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
+
+# --- Tab: Mistakes (typos, reworks, and research breaks) ---
+frame_typos = make_modern_card(tab_mistakes, "Character Typos")
+frame_mistakes = make_modern_card(tab_mistakes, "Sentence Reworks & Breaks")
+frame_lookback = make_modern_card(tab_mistakes, "Second Revision Pass")
+frame_select_retype = make_modern_card(tab_mistakes, "Select, Retype & Overshoot")
+frame_revision_clusters = make_modern_card(tab_mistakes, "Revision Clusters")
+frame_smart_fixes = make_modern_card(tab_mistakes, "Smart Text Fixes")
+frame_leave_mistakes = make_modern_card(tab_mistakes, "Leave Mistakes For Me")
+
+# --- Tab: Hotkeys (controls and what happens when a run ends) ---
+frame_hotkeys = make_modern_card(tab_hotkeys, "Hotkeys")
+frame_completion = make_modern_card(tab_hotkeys, "Alerts")
+frame_check_text = make_modern_card(tab_hotkeys, "Check Typed Text")
+
+# --- Tab: Data (saved settings and logs) ---
+frame_profiles = make_modern_card(tab_data, "Profiles")
+frame_logging = make_modern_card(tab_data, "Session Log")
+frame_updates = make_modern_card(tab_data, "Updates")
+
+# --- Tab: History (what changed in each release; read-only, no settings) ---
+frame_current_version = make_modern_card(tab_history, "Current Version")
+frame_release_list = make_modern_card(tab_history, "Past Releases")
+
+# --- Input file ---
+modern_label(frame_file, "Single File (used if queue is empty):").grid(
+    row=0, column=0, columnspan=2, sticky="w", pady=(0, 2)
+)
+modern_entry(frame_file, input_path_var, width=40).grid(row=1, column=0, padx=(0, 8), sticky="we")
+modern_button(frame_file, "Browse...", browse_input_file, kind="neutral").grid(row=1, column=1)
+frame_file.columnconfigure(0, weight=1)
+
+modern_label(frame_file, "Batch Queue (optional — runs each file in order):").grid(
+    row=2, column=0, columnspan=2, sticky="w", pady=(8, 2)
+)
+
+queue_frame = modern_frame(frame_file, bordered=True)
+queue_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
+queue_frame.columnconfigure(0, weight=1)
+
+file_queue_listbox = tk.Listbox(
+    queue_frame,
+    listvariable=file_queue_var,
+    height=4,
+    selectmode=tk.EXTENDED,
+    font=FONT_BODY,
+    bg=PALETTE["input_bg"],
+    fg=PALETTE["text"],
+    selectbackground=PALETTE["accent"],
+    selectforeground="#ffffff",
+    relief="flat",
+    bd=0,
+    highlightthickness=0,
+    activestyle="none",
+)
+queue_scroll = modern_scrollbar(queue_frame, file_queue_listbox.yview)
+file_queue_listbox.configure(yscrollcommand=queue_scroll.set)
+file_queue_listbox.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+queue_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=10)
+
+
+def _queue_listbox_scroll(event):
+    file_queue_listbox.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    return "break"
+
+
+file_queue_listbox.bind("<MouseWheel>", _queue_listbox_scroll)
+
+queue_btn_frame = modern_frame(frame_file)
+queue_btn_frame.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+modern_button(queue_btn_frame, "Add Files...", add_queue_files, kind="neutral").pack(side="left", padx=(0, 6))
+modern_button(queue_btn_frame, "Remove Selected", remove_selected_queue_files, kind="neutral").pack(side="left", padx=(0, 6))
+modern_button(queue_btn_frame, "Clear Queue", clear_queue_files, kind="neutral").pack(side="left")
+
+# --- Paste text directly ---
+modern_label(frame_file, "Or paste text directly:").grid(
+    row=5, column=0, columnspan=2, sticky="w", pady=(8, 2)
+)
+
+paste_text_box = modern_textbox(frame_file, height=130)
+paste_text_box.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
+
+modern_button(frame_file, "Use Pasted Text", use_pasted_text).grid(
+    row=7, column=0, columnspan=2, sticky="w", pady=(0, 8)
+)
+
+modern_button(frame_file, "Preview Time Estimate", preview_estimate, kind="neutral").grid(
+    row=8, column=0, columnspan=2, sticky="w", pady=(4, 0)
+)
+modern_label(frame_file, textvariable=preview_result_var, kind="muted", wraplength=420).grid(
+    row=9, column=0, columnspan=2, sticky="w", pady=(4, 0)
+)
+modern_label(
+    frame_file,
+    "Tip: wrap exact text in [[double brackets]] to type it with no typos or reworks,\n"
+    "e.g. [[ACC-4471-2290]] \u2014 useful for account numbers, URLs, or exact values.",
+    kind="muted",
+    wraplength=420,
+).grid(row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
+modern_label(frame_file, textvariable=resume_status_var, kind="muted", wraplength=420).grid(
+    row=11, column=0, columnspan=2, sticky="w", pady=(8, 0)
+)
+modern_button(frame_file, "Clear Saved Progress", clear_saved_progress, kind="neutral").grid(
+    row=12, column=0, columnspan=2, sticky="w", pady=(4, 0)
+)
+
+
+# --- Target window lock ---
+if HAS_PYGETWINDOW:
+    window_combo = modern_combobox(frame_window, window_var, width=30)
+    window_combo.grid(row=0, column=0, padx=(0, 8), sticky="we")
+
+    def _window_combo_no_scroll(event):
+        """ttk.Combobox has a built-in binding that cycles its
+        selected value on mouse-wheel scroll. That's normally handy,
+        but here it means scrolling through the Window tab can
+        silently change which window is locked. This instance-level
+        binding takes priority over that class binding, so instead
+        the scroll is forwarded to the page and the dropdown's value
+        is left alone."""
+        tab_window_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    window_combo.bind("<MouseWheel>", _window_combo_no_scroll)
+
+    modern_button(frame_window, "Refresh", refresh_window_list, kind="neutral").grid(row=0, column=1)
+    modern_checkbox(frame_window, "Lock typing to this window", lock_window_var).grid(
+        row=1, column=0, columnspan=2, sticky="w", pady=(8, 0)
+    )
+    frame_window.columnconfigure(0, weight=1)
+    refresh_window_list()
+else:
+    window_combo = None
+    modern_label(
+        frame_window,
+        "pygetwindow not installed \u2014 window lock disabled.\nInstall with: pip install pygetwindow",
+        kind="warning",
+    ).pack(anchor="w")
+
+# --- Auto profile by window (Update #30) ---
+modern_checkbox(
+    frame_auto_profile,
+    "Pick a typing profile automatically from the window title",
+    enable_auto_profile_var,
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+modern_label(
+    frame_auto_profile,
+    "When a run starts, the first rule whose words appear in the target window's title loads its "
+    "profile. The target is the locked window if lock is on, otherwise the window that was active "
+    "when you pressed the Start hotkey. Keep your profiles in the profiles folder.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+modern_label(frame_auto_profile, "Window title contains:").grid(row=2, column=0, columnspan=2, sticky="w")
+modern_entry(frame_auto_profile, auto_profile_keyword_var, width=30).grid(
+    row=3, column=0, columnspan=2, sticky="w", pady=(4, 8)
+)
+
+modern_label(frame_auto_profile, "Use this profile:").grid(row=4, column=0, columnspan=2, sticky="w")
+auto_profile_combo = modern_combobox(frame_auto_profile, auto_profile_choice_var, width=30)
+auto_profile_combo.grid(row=5, column=0, padx=(0, 8), pady=(4, 8), sticky="we")
+modern_button(frame_auto_profile, "Refresh", refresh_auto_profile_choices, kind="neutral").grid(
+    row=5, column=1, pady=(4, 8)
+)
+modern_button(frame_auto_profile, "Add Rule", add_auto_profile_rule).grid(
+    row=6, column=0, columnspan=2, sticky="w", pady=(0, 8)
+)
+
+modern_label(frame_auto_profile, "Rules (checked from the top, the first match wins):").grid(
+    row=7, column=0, columnspan=2, sticky="w", pady=(0, 2)
+)
+auto_profile_list_frame = modern_frame(frame_auto_profile, bordered=True)
+auto_profile_list_frame.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
+auto_profile_list_frame.columnconfigure(0, weight=1)
+
+auto_profile_listbox = tk.Listbox(
+    auto_profile_list_frame,
+    height=4,
+    selectmode=tk.EXTENDED,
+    font=FONT_BODY,
+    bg=PALETTE["input_bg"],
+    fg=PALETTE["text"],
+    selectbackground=PALETTE["accent"],
+    selectforeground="#ffffff",
+    relief="flat",
+    bd=0,
+    highlightthickness=0,
+    activestyle="none",
+    exportselection=False,
+)
+auto_profile_scroll = modern_scrollbar(auto_profile_list_frame, auto_profile_listbox.yview)
+auto_profile_listbox.configure(yscrollcommand=auto_profile_scroll.set)
+auto_profile_listbox.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+auto_profile_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=10)
+
+
+def _auto_profile_listbox_scroll(event):
+    auto_profile_listbox.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    return "break"
+
+
+auto_profile_listbox.bind("<MouseWheel>", _auto_profile_listbox_scroll)
+
+modern_button(
+    frame_auto_profile, "Remove Selected", remove_selected_auto_profile_rules, kind="neutral"
+).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 4))
+modern_label(frame_auto_profile, textvariable=auto_profile_status_var, kind="muted", wraplength=420).grid(
+    row=10, column=0, columnspan=2, sticky="w", pady=(4, 0)
+)
+frame_auto_profile.columnconfigure(0, weight=1)
+refresh_auto_profile_choices()
+refresh_auto_profile_listbox()
+auto_profile_rules_var.trace_add("write", refresh_auto_profile_listbox)
+
+# --- Editor type (Update #58) ---
+modern_label(frame_editor_type, "Typing into:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+editor_mode_combo = modern_combobox(frame_editor_type, editor_mode_var, width=22)
+editor_mode_combo.configure(values=list(EDITOR_MODES))
+editor_mode_combo.grid(row=0, column=1, sticky="w")
+
+modern_label(
+    frame_editor_type,
+    "Tell Amanuensis what kind of program it is typing into, so the text on screen "
+    "matches your file. Plain text (the default) adds nothing. Google Docs or Word "
+    "types a line that starts with 1. or - in a different key order, so the editor "
+    "does not turn it into a list. Code editor clears the editor's own indent after "
+    "each Enter, so your file's indentation is not doubled. For a code editor, it "
+    "also helps to turn off auto-closing brackets and suggestion pop-ups, because "
+    "Amanuensis cannot undo those. Preview skips these extra keys.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Start countdown (Update #43) ---
+modern_label(frame_start_countdown, "Countdown Before Typing (seconds):").grid(
+    row=0, column=0, sticky="w", padx=(0, 8)
+)
+entry_start_countdown = modern_entry(frame_start_countdown, start_countdown_seconds_var, width=8)
+entry_start_countdown.grid(row=0, column=1, sticky="w")
+
+modern_label(
+    frame_start_countdown,
+    "How long Amanuensis waits after you press Start, so you have time to click "
+    "into the window you want it to type in. Use a whole number from 0 to 60. "
+    "10 is the default, and 0 starts typing right away. With a batch queue, "
+    "each file gets this countdown. Preview skips it.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Scheduled start (Update #46) ---
+modern_checkbox(
+    frame_scheduled_start, "Start typing at a set time", enable_scheduled_start_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_scheduled_start, "Start Time:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_scheduled_start = modern_entry(frame_scheduled_start, scheduled_start_time_var, width=12)
+entry_scheduled_start.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_scheduled_start,
+    "Check the box, type a clock time like 3:30 PM or 15:30, and press Start Typing. "
+    "You will be asked to confirm, then Amanuensis waits and starts on its own. A time "
+    "that has already passed today means the same time tomorrow. The start countdown "
+    "above still runs after the start time. Leave this app open and keep the computer "
+    "awake and unlocked. Lock a target window above so it types in the right place. "
+    "Stop also cancels the wait. Preview ignores this.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_label(frame_scheduled_start, textvariable=scheduled_status_var, kind="muted", wraplength=420).grid(
+    row=3, column=0, columnspan=2, sticky="w", pady=(6, 0)
+)
+modern_button(
+    frame_scheduled_start, "Cancel Scheduled Start", cancel_scheduled_start, kind="amber"
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Text size (Update #48) ---
+modern_label(frame_text_size, "App Text Size:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+text_size_combo = modern_combobox(frame_text_size, text_size_percent_var, width=10)
+text_size_combo.configure(values=[f"{choice}%" for choice in TEXT_SIZE_CHOICES], command=on_text_size_chosen)
+text_size_combo.grid(row=0, column=1, sticky="w")
+
+modern_label(
+    frame_text_size,
+    "Makes the text, buttons, boxes, and pop-up windows of the whole app larger. "
+    "100% is the normal size. The new size is saved right away and takes effect the "
+    "next time you launch Amanuensis. If a size is too big for your screen, the next "
+    "launch picks the largest size that fits. This setting stays on this computer: "
+    "profiles do not carry it, and Reset All Settings does not change it.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Activity auto-pause ---
+modern_checkbox(
+    frame_activity, "Auto-pause on mouse/keyboard activity", auto_pause_activity_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_activity, "Movement Sensitivity (px):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_activity_sensitivity = modern_entry(frame_activity, activity_sensitivity_var, width=8)
+entry_activity_sensitivity.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_activity,
+    "Automatically pauses typing if the mouse is moved beyond this distance,\n"
+    "preventing accidental input mixing. Resume with the Resume button or Pause hotkey.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Typing settings ---
+frame_settings.columnconfigure(0, weight=1)
+frame_settings.columnconfigure(1, weight=1)
+
+modern_label(frame_settings, "Min Delay (s)").grid(row=0, column=0, sticky="w")
+entry_min_delay = modern_entry(frame_settings, min_delay_var)
+entry_min_delay.grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+modern_label(frame_settings, "Max Delay (s)").grid(row=0, column=1, sticky="w", padx=(16, 0))
+entry_max_delay = modern_entry(frame_settings, max_delay_var)
+entry_max_delay.grid(row=1, column=1, sticky="w", padx=(16, 0), pady=(4, 0))
+
+modern_separator(frame_settings).grid(row=2, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_label(frame_settings, "Target WPM (optional)").grid(row=3, column=0, sticky="w")
+entry_target_wpm = modern_entry(frame_settings, target_wpm_var)
+entry_target_wpm.grid(row=4, column=0, sticky="w")
+modern_button(frame_settings, "Apply WPM", apply_target_wpm, kind="neutral").grid(
+    row=4, column=1, sticky="w", padx=(16, 0)
+)
+entry_target_wpm.bind("<FocusOut>", apply_target_wpm)
+modern_label(
+    frame_settings,
+    "Sets Min/Max Delay from a words-per-minute target (5 chars/word).\n"
+    "Raw typing speed only -- pauses, breaks, and mistakes are separate\n"
+    "and will bring your overall session average below this number.",
+    kind="muted",
+).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_button(frame_settings, "Learn My Speed", open_learn_speed_window, kind="neutral").grid(
+    row=6, column=0, sticky="w", pady=(10, 0)
+)
+modern_label(
+    frame_settings,
+    "Type a short paragraph and Amanuensis measures your real speed, then\n"
+    "fills in Target WPM, Min Delay, and Max Delay for you.",
+    kind="muted",
+).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Target time (Update #27) ---
+modern_checkbox(
+    frame_target_time, "Enable target time till completion", enable_target_time_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_target_time, "Hours").grid(row=1, column=0, sticky="w")
+modern_label(frame_target_time, "Minutes").grid(row=1, column=1, sticky="w", padx=(16, 0))
+entry_target_hours = modern_entry(frame_target_time, target_hours_var, width=8)
+entry_target_hours.grid(row=2, column=0, sticky="w", pady=(4, 0))
+entry_target_minutes = modern_entry(frame_target_time, target_minutes_var, width=8)
+entry_target_minutes.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(4, 0))
+
+modern_label(
+    frame_target_time,
+    "Sets how long the whole run should take, from the first key to the last. "
+    "The spare time is spent on long breaks, like someone writing over several "
+    "sittings. The longer the target, the longer the breaks: a target of several "
+    "hours can have breaks of an hour or more.\n\n"
+    "Breaks happen at the start of a paragraph or sentence, never inside protected "
+    "text. Time you spend paused yourself does not count. Amanuensis never types "
+    "faster than your speed settings, so a target that is too short cannot be "
+    "reached. Preview ignores this setting.\n\n"
+    "Tip: turn on Target Window Lock (Window tab) so typing never lands in the "
+    "wrong window after a break, and keep the computer awake during a long run.",
+    kind="muted",
+    wraplength=420,
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Fatigue drift ---
+modern_checkbox(
+    frame_fatigue, "Enable fatigue drift", enable_fatigue_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_fatigue, "Fatigue Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_fatigue_strength = modern_entry(frame_fatigue, fatigue_strength_var, width=8)
+entry_fatigue_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_fatigue,
+    "Typing speed gradually slows down during long continuous typing stretches\n"
+    "and partly recovers after research breaks, simulating natural fatigue (0–40%).",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Finger and hand timing ---
+modern_checkbox(
+    frame_finger_timing, "Enable finger and hand timing", enable_finger_timing_var
+).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+modern_label(
+    frame_finger_timing,
+    "Types like real hands on a QWERTY keyboard. When two letters in a row use "
+    "opposite hands (like the \"ti\" in \"time\"), the second one comes a little "
+    "sooner. When two different letters use the same finger (like \"ed\" or \"lo\"), "
+    "it comes a little later.\n\n"
+    "Only letters are affected. Spaces, numbers, punctuation, and doubled letters "
+    "keep their normal timing, and the common letter pairs keep their quick speed.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+# --- Key press timing (Update #59) ---
+modern_checkbox(
+    frame_key_timing, "Enable real key press timing (hold each key down)", enable_key_hold_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_key_timing, "Shortest hold (milliseconds):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_key_hold_min = modern_entry(frame_key_timing, key_hold_min_ms_var, width=8)
+entry_key_hold_min.grid(row=1, column=1, sticky="w")
+
+modern_label(frame_key_timing, "Longest hold (milliseconds):").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+entry_key_hold_max = modern_entry(frame_key_timing, key_hold_max_ms_var, width=8)
+entry_key_hold_max.grid(row=2, column=1, sticky="w", pady=(6, 0))
+
+modern_checkbox(
+    frame_key_timing, "Hold Shift for capital letters", enable_shift_hold_var
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+modern_checkbox(
+    frame_key_timing, "Overlap quick pairs typed by opposite hands (off by default)", enable_key_overlap_var
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+modern_label(frame_key_timing, "Overlap chance (%):").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+entry_key_overlap_chance = modern_entry(frame_key_timing, key_overlap_chance_var, width=8)
+entry_key_overlap_chance.grid(row=5, column=1, sticky="w", pady=(6, 0))
+
+modern_label(
+    frame_key_timing,
+    "Normally every key is pressed and let go in one instant. With this on, each "
+    "letter and the space bar is pressed down, held for a short random time, and "
+    "then released, which helps when a page reacts to the key being released and "
+    "looks more like a real hand. A capital letter holds Shift down just before "
+    "the letter and lets it go just after. With overlap on, the next key can go "
+    "down just before the last one comes up when two quick letters are typed by "
+    "opposite hands (like the \"ti\" in \"time\").\n\n"
+    "The hold time counts as part of the gap before the next key, so your typing "
+    "speed stays the same. Numbers, punctuation, and other characters are still "
+    "typed in one instant, because pressing them by key name can type the wrong "
+    "character on some keyboard layouts. Backspace and shortcuts are instant too. "
+    "Every held key is let go when you press Stop, and the Preview Run presses "
+    "no keys.",
+    kind="muted",
+    wraplength=420,
+).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+# --- Flow and hesitation states (Update #31) ---
+modern_checkbox(
+    frame_typing_moods, "Enable flow and hesitation states", enable_typing_moods_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_typing_moods, "Mood Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_typing_mood_strength = modern_entry(frame_typing_moods, typing_mood_strength_var, width=8)
+entry_typing_mood_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_typing_moods,
+    "Real typing has moods. Sometimes the words come easily and you speed up "
+    "(flow). Other times you second-guess yourself and slow down (hesitation). "
+    "Amanuensis drifts between normal, flow, and hesitant stretches that last a "
+    "few dozen to a few hundred characters, and the speed eases in and out so it "
+    "never jumps.\n\n"
+    "100% is the normal size (flow is about 15% quicker, hesitation about 25% "
+    "slower). Use less for a steadier typist or more for bigger swings (0 to 200). "
+    "A long break puts the typist back in the normal state, and the time estimate "
+    "includes the small average change.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Uneven rhythm (Update #40) ---
+modern_checkbox(
+    frame_uneven_rhythm, "Type with an uneven rhythm", enable_uneven_rhythm_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_uneven_rhythm, "Rhythm Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_rhythm_strength = modern_entry(frame_uneven_rhythm, rhythm_strength_var, width=8)
+entry_rhythm_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_uneven_rhythm,
+    "A real typist does not keep one steady beat. Everyday words and familiar "
+    "phrases (like of the, as well as, or a lot of) come out a little quicker, "
+    "about 15% faster. Names in the middle of a sentence, hard or technical "
+    "words, numbers, punctuation marks, and carefully hedged claims (like "
+    "perhaps, tends to, or in some cases) come out slower, about 20 to 30% "
+    "slower.\n\n"
+    "100% is the normal size. Use less for a steadier rhythm or more for bigger "
+    "differences (0 to 200). Only the speed of the keys changes. No pauses are "
+    "added here (the pause cards do that). Protected text always types at the "
+    "normal speed, and the time estimate includes the change.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Natural pauses (always on, not tied to any enable checkbox) ---
+modern_label(frame_pauses, "Paragraph pause, min (s)").grid(row=0, column=0, sticky="w")
+modern_label(frame_pauses, "Paragraph pause, max (s)").grid(row=0, column=1, sticky="w", padx=(16, 0))
+entry_paragraph_pause_min = modern_entry(frame_pauses, paragraph_pause_min_var)
+entry_paragraph_pause_min.grid(row=1, column=0, sticky="w")
+entry_paragraph_pause_max = modern_entry(frame_pauses, paragraph_pause_max_var)
+entry_paragraph_pause_max.grid(row=1, column=1, sticky="w", padx=(16, 0))
+modern_label(
+    frame_pauses, "A short pause to think happens at every paragraph, on top of any research break.",
+    kind="muted",
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 10))
+
+modern_label(frame_pauses, "Sentence-end pause, min (s)").grid(row=3, column=0, sticky="w")
+modern_label(frame_pauses, "Sentence-end pause, max (s)").grid(row=3, column=1, sticky="w", padx=(16, 0))
+entry_sentence_pause_min = modern_entry(frame_pauses, sentence_pause_min_var)
+entry_sentence_pause_min.grid(row=4, column=0, sticky="w")
+entry_sentence_pause_max = modern_entry(frame_pauses, sentence_pause_max_var)
+entry_sentence_pause_max.grid(row=4, column=1, sticky="w", padx=(16, 0))
+
+modern_separator(frame_pauses).grid(row=5, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_checkbox(
+    frame_pauses, "Enable inline pause markers", enable_pause_markers_var
+).grid(row=6, column=0, columnspan=2, sticky="w")
+modern_label(
+    frame_pauses,
+    "Put {{pause:5}} anywhere in your text to wait 5 seconds at that spot\n"
+    "(decimals work, max 600). The marker itself is never typed.\n"
+    "Turn this off to type markers as normal text.",
+    kind="muted",
+).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Difficulty pauses (Update #33) ---
+modern_checkbox(
+    frame_difficulty_pauses, "Enable difficulty-aware thinking pauses", enable_difficulty_pauses_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_difficulty_pauses, "Pause Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_difficulty_pause_strength = modern_entry(frame_difficulty_pauses, difficulty_pause_strength_var, width=8)
+entry_difficulty_pause_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_difficulty_pauses,
+    "Real people slow down on hard material. Amanuensis stops for a moment before "
+    "a hard word (long, many syllables, numbers, or an acronym) and for a little "
+    "longer before a very long or packed sentence. It does not stop for every hard "
+    "word, and never twice in a row.\n\n"
+    "100% is the normal length. Use less for shorter pauses or more for longer ones "
+    "(0 to 300). Protected text never gets a pause, and the time estimate includes "
+    "these pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Typing bursts (Update #37) ---
+modern_checkbox(
+    frame_typing_bursts, "Type in bursts with short pauses between them", enable_typing_bursts_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_typing_bursts, "Pause Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_burst_pause_strength = modern_entry(frame_typing_bursts, burst_pause_strength_var, width=8)
+entry_burst_pause_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_typing_bursts,
+    "People type a phrase, stop for a moment to think, then carry on. Amanuensis "
+    "does the same: bursts of about 8 to 16 words when the wording is plain and "
+    "familiar, and shorter bursts of about 3 to 7 words in a sentence with a hard "
+    "word, an argument word like \"because\" or \"however\", or many commas. A "
+    "burst often ends at a comma when one is close. Not every burst ends with a "
+    "pause.\n\n"
+    "100% is the normal length (usually under a second and a half). Use "
+    "less for shorter pauses or more for longer ones (0 to 300). Protected text "
+    "never gets a pause, and the time estimate includes these pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Decision pauses (Update #38) ---
+modern_checkbox(
+    frame_decision_pauses, "Pause at decision points", enable_decision_pauses_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_decision_pauses, "Pause Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_decision_pause_strength = modern_entry(frame_decision_pauses, decision_pause_strength_var, width=8)
+entry_decision_pause_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_decision_pauses,
+    "Writers stop longest where they have to decide something. Amanuensis pauses "
+    "before a new paragraph, before a sentence that states a claim (like I "
+    "believe, this shows, or the evidence), and before a transition (like "
+    "however, for example, or in conclusion). Hard words have their own pause "
+    "in Difficulty Pauses. Not every spot pauses.\n\n"
+    "100% is the normal length (usually 1 to 3 seconds). Use less for shorter "
+    "pauses or more for longer ones (0 to 300). Protected text never gets a "
+    "pause, and the time estimate includes these pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Writing habits (Update #41) ---
+modern_checkbox(
+    frame_writing_habits, "Type with consistent writing habits", enable_writing_habits_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_writing_habits, "Habit Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_writing_habit_strength = modern_entry(frame_writing_habits, writing_habit_strength_var, width=8)
+entry_writing_habit_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_writing_habits,
+    "Every writer has habits. Amanuensis gives each file its own set. The typist "
+    "may always stop before an opening parenthesis or a dash used as an aside, "
+    "before an opening quotation mark, or before a heading and the first line "
+    "under it, and may rush or linger over commas. The habits are picked from the "
+    "text, so the same file always gets the same habits, and they stay the same "
+    "through the whole run, even after a resume. Not every spot pauses.\n\n"
+    "100% is the normal length (usually under a second and a half). Use less for "
+    "shorter pauses or more for longer ones (0 to 200). Protected text never gets "
+    "a pause, and the time estimate includes these habits.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Essay pace (Update #42) ---
+modern_checkbox(
+    frame_essay_pace, "Change the pace from the opening to the closing", enable_essay_pace_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_essay_pace, "Pace Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_essay_pace_strength = modern_entry(frame_essay_pace, essay_pace_strength_var, width=8)
+entry_essay_pace_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_essay_pace,
+    "A writer does not keep one pace from the first line to the last. The opening "
+    "(the first 15% of the file) is typed a little slower, about 10%, and the "
+    "typist stops now and then to plan. Once the argument is set, the body gets "
+    "quicker, about 8% faster. The closing (the last 15%) slows down again, about "
+    "12% slower, with a few stops to decide how to end.\n\n"
+    "100% is the normal size. Use less for an even pace or more for bigger "
+    "differences (0 to 200). Files shorter than 1,200 characters are left alone. "
+    "Protected text always types at the normal speed and never gets a pause, and "
+    "the time estimate includes the change.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Warm-up after breaks (Update #45) ---
+modern_checkbox(
+    frame_warmup, "Type a little slower right after a long break", enable_warmup_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_warmup, "Warm-Up Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_warmup_strength = modern_entry(frame_warmup, warmup_strength_var, width=8)
+entry_warmup_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_warmup,
+    "A typist does not come back from a break at full speed. After a research "
+    "break, a long session break, a long pause marker, or any other wait of 8 "
+    "seconds or more, the first 20 or so characters are typed a little slower "
+    "(about 30% slower on the first key), and the speed eases back to normal.\n\n"
+    "100% is the normal size. Use less for a smaller effect or more for a bigger "
+    "one (0 to 200). Only the speed changes, so no pauses are added. Protected "
+    "text always types at the normal speed, and the time estimate includes the "
+    "average effect of research breaks and long natural pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Formatting markers (Update #29) ---
+modern_checkbox(
+    frame_format_markers, "Press bold and italic shortcuts for formatting markers", enable_format_markers_var
+).grid(row=0, column=0, sticky="w")
+modern_label(
+    frame_format_markers,
+    "Wrap text in [[b]]bold[[/b]] or [[i]]italic[[/i]] and Amanuensis presses "
+    "Ctrl+B or Ctrl+I at those spots, so it comes out formatted in Google Docs "
+    "or Word. The markers themselves are never typed. You can use both at once.\n\n"
+    "Turn this off to remove the markers without pressing any shortcut (good for "
+    "plain web forms, where Ctrl+B may do something else).\n\n"
+    "[[b]], [[/b]], [[i]], and [[/i]] are reserved, so protected text cannot be "
+    "exactly b or i. Reworks never delete the first formatted word, and the "
+    "sentence drafts are skipped while a style is on. When resuming, click right "
+    "after the last typed character so the formatting carries on.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+# --- Character typos ---
+modern_checkbox(frame_typos, "Enable adjacent-key typos", enable_typos_var).grid(
+    row=0, column=0, columnspan=2, sticky="w"
+)
+modern_label(frame_typos, "Chance per letter (%)").grid(row=1, column=0, sticky="w", pady=(6, 0))
+entry_typo_chance = modern_entry(frame_typos, typo_chance_var)
+entry_typo_chance.grid(row=2, column=0, sticky="w")
+modern_label(
+    frame_typos,
+    "A wrong, physically nearby key gets typed, paused on,\nthen corrected -- like a real everyday typo.",
+    kind="muted",
+).grid(row=1, column=1, rowspan=2, sticky="w", padx=(16, 0))
+
+modern_checkbox(
+    frame_typos, "Use extra typo types", use_extra_typos_var
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+modern_label(
+    frame_typos,
+    "Adds swapped letters ('teh'), doubled letters, and missed spaces,\n"
+    "noticed late and corrected after 1-3 extra characters (shares typo chance).",
+    kind="muted",
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+modern_checkbox(
+    frame_typos, "Capital letter slips", enable_capital_slips_var
+).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+modern_label(
+    frame_typos,
+    "Now and then a letter inside a word comes out as a capital ('tHe'),\n"
+    "then gets fixed. It takes the place of some typos (shares typo chance).",
+    kind="muted",
+).grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+# --- Mistake & break frequency ---
+modern_checkbox(
+    frame_mistakes,
+    "Enable sentence reworks (pause, delete last few words, retype)",
+    enable_mistakes_var,
+).grid(
+    row=0, column=0, columnspan=2, sticky="w"
+)
+modern_label(frame_mistakes, "Min words").grid(row=1, column=0, sticky="w", pady=(6, 0))
+modern_label(frame_mistakes, "Max words").grid(row=1, column=1, sticky="w", padx=(16, 0), pady=(6, 0))
+entry_mistake_min = modern_entry(frame_mistakes, mistake_min_var)
+entry_mistake_min.grid(row=2, column=0, sticky="w")
+entry_mistake_max = modern_entry(frame_mistakes, mistake_max_var)
+entry_mistake_max.grid(row=2, column=1, sticky="w", padx=(16, 0))
+
+modern_separator(frame_mistakes).grid(row=3, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_checkbox(frame_mistakes, "Enable research breaks", enable_breaks_var).grid(
+    row=4, column=0, columnspan=2, sticky="w"
+)
+modern_label(frame_mistakes, "Min paragraphs").grid(row=5, column=0, sticky="w", pady=(6, 0))
+modern_label(frame_mistakes, "Max paragraphs").grid(row=5, column=1, sticky="w", padx=(16, 0), pady=(6, 0))
+entry_break_min = modern_entry(frame_mistakes, break_min_var)
+entry_break_min.grid(row=6, column=0, sticky="w")
+entry_break_max = modern_entry(frame_mistakes, break_max_var)
+entry_break_max.grid(row=6, column=1, sticky="w", padx=(16, 0))
+
+modern_label(frame_mistakes, "Min duration (s)").grid(row=7, column=0, sticky="w", pady=(6, 0))
+modern_label(frame_mistakes, "Max duration (s)").grid(row=7, column=1, sticky="w", padx=(16, 0), pady=(6, 0))
+entry_break_duration_min = modern_entry(frame_mistakes, break_duration_min_var)
+entry_break_duration_min.grid(row=8, column=0, sticky="w")
+entry_break_duration_max = modern_entry(frame_mistakes, break_duration_max_var)
+entry_break_duration_max.grid(row=8, column=1, sticky="w", padx=(16, 0))
+
+modern_separator(frame_mistakes).grid(row=9, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_checkbox(
+    frame_mistakes,
+    "Enable paragraph-ending paraphrase & correct",
+    enable_paraphrase_var,
+).grid(row=10, column=0, columnspan=2, sticky="w")
+modern_label(frame_mistakes, "Chance (%)").grid(row=11, column=0, sticky="w", pady=(6, 0))
+entry_paraphrase_chance = modern_entry(frame_mistakes, paraphrase_chance_var)
+entry_paraphrase_chance.grid(row=12, column=0, sticky="w")
+modern_label(
+    frame_mistakes,
+    "Drafts an alternative sentence at paragraph ends,\n"
+    "pauses, deletes it, then writes the real text.\n"
+    "(Uses simple word substitution, not AI rewriting.)",
+    kind="muted",
+).grid(row=11, column=1, rowspan=2, sticky="w", padx=(16, 0))
+
+# --- Second revision pass (Update #34) ---
+modern_checkbox(
+    frame_lookback, "Enable second revision pass (go back and fix an earlier word)", enable_lookback_edit_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_lookback, "Chance per paragraph (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_lookback_chance = modern_entry(frame_lookback, lookback_edit_chance_var, width=8)
+entry_lookback_chance.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_lookback,
+    "Real writers reread a paragraph and go back to change a word in an earlier "
+    "sentence. With this on, one word in a paragraph is first typed as a close "
+    "synonym. When the paragraph is finished, Amanuensis presses the Left arrow "
+    "key to go back, deletes the word, types the real one, and presses the Right "
+    "arrow key to return to the end. Your text always ends up exactly as written "
+    "in the file.\n\n"
+    "It only picks plain words 30 to 250 characters back, and skips paragraphs "
+    "with protected text, bold or italic markers, purposely left mistakes, or "
+    "symbols an editor might change. It needs an editor where the arrow keys move "
+    "the cursor (like Google Docs or Word), so it is off by default. Preview shows "
+    "the change without pressing any keys. If you press Stop before a word is "
+    "fixed, a message tells you what to change by hand.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Select, retype & overshoot (Update #35) ---
+modern_checkbox(
+    frame_select_retype, "Enable select and retype (highlight a word and type over it)", enable_select_retype_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_select_retype, "Chance per paragraph (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_select_retype_chance = modern_entry(frame_select_retype, select_retype_chance_var, width=8)
+entry_select_retype_chance.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_select_retype,
+    "Right after finishing a word, Amanuensis can decide it was the wrong word. "
+    "One word in a paragraph is first typed as a close synonym. Then it holds "
+    "Shift and taps the Left arrow key once per letter to highlight the word, "
+    "and types the real word over it. Your text always ends up exactly as "
+    "written in the file.\n\n"
+    "It needs an editor where Shift+Left highlights text (like Google Docs or "
+    "Word), so it is off by default. Please do not click while a word is "
+    "highlighted. It only picks plain words, and skips words touched by "
+    "protected text, bold or italic markers, or purposely left mistakes. "
+    "Preview shows the change without pressing any keys. If you press Stop in "
+    "the middle, a message tells you what to fix by hand.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_separator(frame_select_retype).grid(row=3, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_checkbox(
+    frame_select_retype, "Enable overshoot (delete one letter too many, then retype it)", enable_overshoot_var
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_select_retype, "Chance per typo fix (%):").grid(row=5, column=0, sticky="w", padx=(0, 8))
+entry_overshoot_chance = modern_entry(frame_select_retype, overshoot_chance_var, width=8)
+entry_overshoot_chance.grid(row=5, column=1, sticky="w")
+
+modern_label(
+    frame_select_retype,
+    "After a typo is backspaced away, a real typist sometimes presses Backspace "
+    "once too often. With this on, Amanuensis sometimes deletes the letter before "
+    "the cursor, pauses as if noticing, and types that letter again. It only uses "
+    "the Backspace key, so it works in any text box. It only happens when "
+    "character typos are on, and never next to bold or italic text.",
+    kind="muted",
+    wraplength=420,
+).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Revision clusters (Update #39) ---
+modern_checkbox(
+    frame_revision_clusters, "Enable revision clusters (bunch edits together)", enable_revision_clusters_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_revision_clusters, "Cluster Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_cluster_strength = modern_entry(frame_revision_clusters, cluster_strength_var, width=8)
+entry_cluster_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(frame_revision_clusters, "Revision style:").grid(
+    row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+)
+revision_style_combo = modern_combobox(frame_revision_clusters, revision_style_var, width=22)
+revision_style_combo.configure(values=list(CLUSTER_STYLES))
+revision_style_combo.grid(row=2, column=1, sticky="w", pady=(8, 0))
+
+modern_label(
+    frame_revision_clusters,
+    "Real revising bunches together. A writer changes a phrase, fixes a few "
+    "more things in a row, then drafts calmly for a while. With this on, your "
+    "typos, sentence reworks, drafted paraphrases, and second revision or "
+    "select and retype words land in short stretches (about 70 to 220 "
+    "characters, starting at the beginning of a sentence) instead of being "
+    "spread evenly. The typing between those stretches is calmer, so you get "
+    "about the same number of mistakes overall and the time estimate does not "
+    "change.\n\n"
+    "Edit as I go spreads the stretches through each paragraph. Draft, then "
+    "revise keeps the start of a paragraph calm and puts one stretch at its "
+    "end, like rereading and fixing what you just wrote. Mixed uses a bit of "
+    "both. 100% is the normal size. Use less for a gentler difference or more "
+    "for stronger bunching (0 to 200). Only paragraphs of 160 characters or "
+    "more get stretches. This only moves your other mistake settings around, "
+    "so it does nothing when they are all off. Protected text is never "
+    "touched.",
+    kind="muted",
+    wraplength=420,
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Smart text fixes (Update #22) ---
+modern_checkbox(frame_smart_fixes, "Enable smart text fixes", enable_smart_fixes_var).grid(
+    row=0, column=0, columnspan=2, sticky="w"
+)
+modern_label(
+    frame_smart_fixes,
+    "Fixes common slips in your text before it is typed, using simple\n"
+    "built-in rules. Everything stays on your computer: no AI, no internet.",
+    kind="muted",
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+modern_separator(frame_smart_fixes).grid(row=2, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_checkbox(
+    frame_smart_fixes, "Spacing (extra, trailing, and missing spaces)", smart_fix_spacing_var
+).grid(row=3, column=0, columnspan=2, sticky="w")
+modern_checkbox(
+    frame_smart_fixes,
+    "Punctuation (missing commas and end periods, doubled marks)",
+    smart_fix_punctuation_var,
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+modern_checkbox(
+    frame_smart_fixes, "Capitalization (sentence starts and the word I)", smart_fix_capitalization_var
+).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+modern_checkbox(
+    frame_smart_fixes, "Repeated words (\"the the\")", smart_fix_repeated_words_var
+).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+modern_separator(frame_smart_fixes).grid(row=7, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_label(frame_smart_fixes, "Show fixes being noticed (%)").grid(row=8, column=0, sticky="w")
+entry_smart_fix_visible_chance = modern_entry(frame_smart_fixes, smart_fix_visible_chance_var)
+entry_smart_fix_visible_chance.grid(row=9, column=0, sticky="w")
+modern_label(
+    frame_smart_fixes,
+    "That share of fixes is acted out: a quick slip, a pause,\n"
+    "then a backspace. The final text is the same either way.",
+    kind="muted",
+).grid(row=8, column=1, rowspan=2, sticky="w", padx=(16, 0))
+
+modern_button(
+    frame_smart_fixes, "Review Fixes For This File...", open_smart_fix_review, kind="neutral"
+).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
+modern_label(
+    frame_smart_fixes,
+    "Text inside [[double brackets]] is never changed. English rules only.\n"
+    "Web addresses, emails, file paths, and code are left alone.",
+    kind="muted",
+).grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+# --- Leave mistakes for me (Update #24) ---
+modern_checkbox(
+    frame_leave_mistakes, "Leave some mistakes for me to fix", enable_leave_mistakes_var
+).grid(row=0, column=0, columnspan=2, sticky="w")
+modern_label(
+    frame_leave_mistakes,
+    "Purposely leaves a few mistakes in the typed text so you can\n"
+    "find and fix them yourself. When the run ends, a list shows\n"
+    "exactly where each one is and what it should be.",
+    kind="muted",
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+modern_separator(frame_leave_mistakes).grid(row=2, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_label(frame_leave_mistakes, "Mistakes to leave (per file)").grid(row=3, column=0, sticky="w")
+entry_leave_mistake_count = modern_entry(frame_leave_mistakes, leave_mistake_count_var)
+entry_leave_mistake_count.grid(row=4, column=0, sticky="w")
+modern_label(
+    frame_leave_mistakes,
+    "Spread out across the file. If the text has too few\n"
+    "safe spots, fewer are left.",
+    kind="muted",
+).grid(row=3, column=1, rowspan=2, sticky="w", padx=(16, 0))
+
+modern_separator(frame_leave_mistakes).grid(row=5, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_checkbox(
+    frame_leave_mistakes, "Typos (letters and joined words)", leave_mistakes_typos_var
+).grid(row=6, column=0, columnspan=2, sticky="w")
+modern_checkbox(frame_leave_mistakes, "Missing commas", leave_mistakes_commas_var).grid(
+    row=7, column=0, columnspan=2, sticky="w", pady=(8, 0)
+)
+modern_checkbox(
+    frame_leave_mistakes,
+    "Missing punctuation (periods, ? ! and apostrophes)",
+    leave_mistakes_punctuation_var,
+).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+modern_separator(frame_leave_mistakes).grid(row=9, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_button(
+    frame_leave_mistakes, "View Last Mistake List", open_left_mistake_report, kind="neutral"
+).grid(row=10, column=0, columnspan=2, sticky="w")
+modern_label(
+    frame_leave_mistakes,
+    "Text inside [[double brackets]] is never changed. The typer never\n"
+    "fixes a left mistake by accident. Smart Text Fixes run first.",
+    kind="muted",
+).grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+# --- Hotkeys ---
+entry_hotkey_start = modern_entry(frame_hotkeys, hotkey_start_var)
+entry_hotkey_pause = modern_entry(frame_hotkeys, hotkey_pause_var)
+entry_hotkey_stop = modern_entry(frame_hotkeys, hotkey_stop_var)
+entry_hotkey_skip_break = modern_entry(frame_hotkeys, hotkey_skip_break_var)
+
+modern_label(frame_hotkeys, "Start").grid(row=0, column=0, sticky="w")
+modern_label(frame_hotkeys, "Pause").grid(row=0, column=1, sticky="w", padx=(16, 0))
+modern_label(frame_hotkeys, "Stop").grid(row=0, column=2, sticky="w", padx=(16, 0))
+entry_hotkey_start.grid(row=1, column=0, sticky="w", pady=(2, 0))
+entry_hotkey_pause.grid(row=1, column=1, sticky="w", padx=(16, 0), pady=(2, 0))
+entry_hotkey_stop.grid(row=1, column=2, sticky="w", padx=(16, 0), pady=(2, 0))
+
+modern_label(frame_hotkeys, "Skip Break").grid(row=2, column=0, sticky="w", pady=(10, 0))
+entry_hotkey_skip_break.grid(row=3, column=0, sticky="w", pady=(2, 0))
+modern_label(
+    frame_hotkeys,
+    "Ends the research break that is counting down right now, and only that\n"
+    "one. It does nothing when no break is running. The Skip Break button\n"
+    "at the bottom does the same thing.",
+    kind="muted",
+).grid(row=3, column=1, columnspan=2, sticky="w", padx=(16, 0), pady=(2, 0))
+
+modern_button(frame_hotkeys, "Apply Hotkeys", apply_hotkeys).grid(
+    row=4, column=0, columnspan=3, pady=(12, 0), sticky="w"
+)
+modern_label(frame_hotkeys, textvariable=hotkey_warning_var, kind="warning").grid(
+    row=5, column=0, columnspan=3, pady=(6, 0), sticky="w"
+)
+
+# Rebind only on focus-out (debounced) rather than on every keystroke
+entry_hotkey_start.bind("<FocusOut>", apply_hotkeys)
+entry_hotkey_pause.bind("<FocusOut>", apply_hotkeys)
+entry_hotkey_stop.bind("<FocusOut>", apply_hotkeys)
+entry_hotkey_skip_break.bind("<FocusOut>", apply_hotkeys)
+
+# --- Profiles ---
+modern_button(frame_profiles, "Save Profile...", save_profile, kind="neutral").grid(row=0, column=0, padx=(0, 8))
+modern_button(frame_profiles, "Load Profile...", load_profile, kind="neutral").grid(row=0, column=1, padx=(0, 8))
+modern_button(frame_profiles, "Reset All Settings", reset_to_defaults, kind="danger").grid(row=0, column=2)
+modern_label(
+    frame_profiles,
+    "Your settings are also remembered automatically between launches --\nuse these only if you want named presets to switch between.",
+    kind="muted",
+).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+# Starter profiles (Update #47): built-in typing styles to begin from.
+modern_label(frame_profiles, "Starter profiles (built in, a good place to begin):").grid(
+    row=2, column=0, columnspan=3, sticky="w", pady=(14, 0)
+)
+starter_profile_combo = modern_combobox(frame_profiles, starter_profile_choice_var, width=24)
+starter_profile_combo.configure(values=get_starter_profile_names())
+starter_profile_combo.grid(row=3, column=0, columnspan=2, padx=(0, 8), pady=(4, 8), sticky="w")
+modern_button(frame_profiles, "Load Starter Profile", load_starter_profile).grid(
+    row=3, column=2, pady=(4, 8), sticky="w"
+)
+modern_label(
+    frame_profiles,
+    textvariable=starter_profile_description_var,
+    kind="muted",
+    wraplength=520,
+).grid(row=4, column=0, columnspan=3, sticky="w")
+
+# --- Logging ---
+modern_checkbox(
+    frame_logging,
+    "Enable session log (auto-saved as CSV when a run ends)",
+    log_enabled_var,
+).grid(row=0, column=0, columnspan=2, sticky="w")
+modern_button(frame_logging, "Export Log Now", lambda: export_log(auto=False), kind="neutral").grid(
+    row=1, column=0, sticky="w", pady=(10, 0), padx=(0, 8)
+)
+modern_button(frame_logging, "View Last Session Log", open_log_viewer, kind="neutral").grid(
+    row=1, column=1, sticky="w", pady=(10, 0)
+)
+
+# --- Alerts (finished and auto-pause) ---
+modern_checkbox(
+    frame_completion, "Show notification when finished", enable_notify_var
+).grid(row=0, column=0, sticky="w")
+modern_checkbox(
+    frame_completion, "Play sound when finished", enable_sound_var
+).grid(row=1, column=0, sticky="w", pady=(8, 0))
+if not HAS_WINSOUND:
+    modern_label(
+        frame_completion,
+        "winsound not available on this platform \u2014 sound disabled.",
+        kind="warning",
+    ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+modern_label(
+    frame_completion,
+    "Both only trigger when a run finishes naturally, not on a manual Stop.",
+    kind="muted",
+).grid(row=3, column=0, sticky="w", pady=(6, 0))
+modern_checkbox(
+    frame_completion, "Beep when typing pauses by itself", alert_on_auto_pause_var
+).grid(row=4, column=0, sticky="w", pady=(14, 0))
+modern_label(
+    frame_completion,
+    "Plays a short warning beep when a run auto-pauses: the locked window lost focus,\n"
+    "or mouse movement triggered Auto-pause on activity. It never beeps when you pause\n"
+    "yourself, and not in a preview. It works on its own, even if the finished sound\n"
+    "is off, and needs Windows sound.",
+    kind="muted",
+).grid(row=5, column=0, sticky="w", pady=(6, 0))
+
+# --- Check Typed Text (Update #51) ---
+modern_checkbox(
+    frame_check_text, "Check typed text when a run finishes", check_typed_text_var
+).grid(row=0, column=0, sticky="w")
+modern_label(
+    frame_check_text,
+    "Reads the text back from the target window and compares it with the text that\n"
+    "should be there. It presses Ctrl+Shift+Home and Ctrl+C there, then puts your\n"
+    "earlier clipboard text back. Keep the target window in front until it is done.\n"
+    "It cannot work where copying is blocked. Preview runs are always checked,\n"
+    "with no clipboard.",
+    kind="muted",
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
+modern_button(
+    frame_check_text, "View Last Text Check", open_text_check_report, kind="neutral"
+).grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+# --- Updates (Update #25) ---
+modern_checkbox(
+    frame_updates, "Check for updates when the app starts", enable_update_check_var
+).grid(row=0, column=0, sticky="w")
+modern_label(
+    frame_updates,
+    "Asks GitHub for the newest version number. Nothing from your\n"
+    "text or settings is ever sent. Turn this off to keep the app\n"
+    "fully offline.",
+    kind="muted",
+).grid(row=1, column=0, sticky="w", pady=(4, 0))
+modern_separator(frame_updates).grid(row=2, column=0, sticky="we", pady=10)
+modern_button(
+    frame_updates, "Check for Updates Now", check_for_updates_now, kind="neutral"
+).grid(row=3, column=0, sticky="w")
+modern_label(
+    frame_updates, textvariable=update_status_var, kind="muted", wraplength=480
+).grid(row=4, column=0, sticky="w", pady=(8, 0))
+
+# --- Version History (Idea #23) ---
+# Read-only. Nothing here is a setting, so it is not part of the settings
+# dict, the snapshots, or the Reset This Section list.
+HISTORY_TEXT_WRAP = 500
+# How many releases the tab shows in total. The newest one gets the Current
+# Version card, so the Past Releases card shows the (this number - 1) before it.
+HISTORY_VERSIONS_SHOWN = 10
+
+
+def format_release_heading(entry):
+    """One line like 'v4.2.0  |  2026-10-09  |  Version History tab'."""
+    date_text = entry["date"] if entry["date"] else "date not recorded"
+    return f"v{entry['version']}  |  {date_text}  |  {entry['title']}"
+
+
+def format_release_changes(entry):
+    """The change lines of one release as bullet-style text."""
+    return "\n".join(f"\u2022 {line}" for line in entry["changes"])
+
+
+_latest_release = VERSION_HISTORY[0]
+modern_label(frame_current_version, f"Amanuensis v{APP_VERSION}", kind="stat").grid(
+    row=0, column=0, sticky="w"
+)
+modern_label(
+    frame_current_version,
+    format_release_heading(_latest_release).split("  |  ", 1)[1],
+    kind="muted",
+    wraplength=HISTORY_TEXT_WRAP,
+).grid(row=1, column=0, sticky="w", pady=(2, 0))
+modern_label(
+    frame_current_version,
+    format_release_changes(_latest_release),
+    wraplength=HISTORY_TEXT_WRAP,
+).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+frame_release_list.columnconfigure(0, weight=1)
+_history_row = 0
+_past_releases = VERSION_HISTORY[1:HISTORY_VERSIONS_SHOWN]
+for _release_index, _release in enumerate(_past_releases):
+    if _release_index > 0:
+        modern_separator(frame_release_list).grid(row=_history_row, column=0, sticky="we", pady=10)
+        _history_row += 1
+    modern_label(
+        frame_release_list,
+        format_release_heading(_release),
+        kind="status",
+        wraplength=HISTORY_TEXT_WRAP,
+    ).grid(row=_history_row, column=0, sticky="w")
+    _history_row += 1
+    modern_label(
+        frame_release_list,
+        format_release_changes(_release),
+        wraplength=HISTORY_TEXT_WRAP,
+    ).grid(row=_history_row, column=0, sticky="w", pady=(4, 0))
+    _history_row += 1
+
+# --- Per-section reset buttons (Idea #19) ---
+# Each button is added in the first free row at the bottom of its card,
+# after the card has been fully built above.
+SECTION_CARDS = {
+    "Auto Profile": frame_auto_profile,
+    "Editor Type": frame_editor_type,
+    "Start Countdown": frame_start_countdown,
+    "Scheduled Start": frame_scheduled_start,
+    "Activity Auto-Pause": frame_activity,
+    "Typing Speed": frame_settings,
+    "Target Time": frame_target_time,
+    "Fatigue Drift": frame_fatigue,
+    "Finger & Hand Timing": frame_finger_timing,
+    "Key Press Timing": frame_key_timing,
+    "Flow & Hesitation": frame_typing_moods,
+    "Uneven Rhythm": frame_uneven_rhythm,
+    "Natural Pauses": frame_pauses,
+    "Difficulty Pauses": frame_difficulty_pauses,
+    "Typing Bursts": frame_typing_bursts,
+    "Decision Pauses": frame_decision_pauses,
+    "Writing Habits": frame_writing_habits,
+    "Essay Pace": frame_essay_pace,
+    "Warm-Up After Breaks": frame_warmup,
+    "Formatting Markers": frame_format_markers,
+    "Character Typos": frame_typos,
+    "Sentence Reworks & Breaks": frame_mistakes,
+    "Second Revision Pass": frame_lookback,
+    "Select, Retype & Overshoot": frame_select_retype,
+    "Revision Clusters": frame_revision_clusters,
+    "Smart Text Fixes": frame_smart_fixes,
+    "Leave Mistakes For Me": frame_leave_mistakes,
+    "Hotkeys": frame_hotkeys,
+    "Session Log": frame_logging,
+    "Alerts": frame_completion,
+    "Check Typed Text": frame_check_text,
+    "Updates": frame_updates,
+}
+
+
+def add_section_reset_button(section_name, card):
+    """Adds a 'Reset This Section' button in the next free grid row at
+    the bottom-right of a card."""
+    columns_used, next_row = card.grid_size()
+    # An extra stretchy column pushes the button to the card's right edge.
+    card.columnconfigure(columns_used, weight=1)
+    reset_button = modern_button(
+        card, "Reset This Section", lambda name=section_name: reset_section(name), kind="danger"
+    )
+    reset_button.grid(row=next_row, column=0, columnspan=columns_used + 1, sticky="e", pady=(10, 0))
+
+
+for _section_name, _section_card in SECTION_CARDS.items():
+    add_section_reset_button(_section_name, _section_card)
+
+# Size the window to fit the finished interface (Idea #21), then restore
+# last-used settings and start the periodic GUI refresh + queue-draining
+# loops. Auto-save happens on close via on_close(), registered below.
+calculate_window_sizes()
+load_last_settings()
+input_path_var.trace_add("write", lambda *args: refresh_resume_status())
+file_queue_var.trace_add("write", lambda *args: refresh_resume_status())
+refresh_resume_status()
+# The interface is finished and sized, so show the window (hidden since the top
+# of the GUI setup, see "Launch speed" above) before the hotkeys are set up.
+window.deiconify()
+apply_hotkeys()
+window.protocol("WM_DELETE_WINDOW", on_close)
+window.after(UPDATE_STARTUP_DELAY_MS, run_startup_update_check)
+window.after(UPDATE_CLEANUP_DELAY_MS, cleanup_update_leftovers)
+window.after(500, update_gui)
+window.after(50, process_gui_queue)
+window.after(900, fit_text_size_to_screen)
+window.mainloop()
